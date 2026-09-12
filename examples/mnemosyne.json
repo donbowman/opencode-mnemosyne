@@ -1,0 +1,42 @@
+{
+  "$comment": "Example config for opencode-mnemosyne. Copy to ~/.config/opencode/mnemosyne.json. Precedence: defaults < this file < MNEMOSYNE_* env vars. If url/token are omitted, they are read from the matching MCP server entry in ~/.config/opencode/opencode.jsonc.",
+  "url": "https://your-mnemosyne-host.example/mcp",
+  "token": "{env:MNEMOSYNE_API_KEY}",
+  "debug": false,
+  "recall": {
+    "enabled": true,
+    "limit": 6,
+    "minScore": 0.12,
+    "perMemoryChars": 400,
+    "totalChars": 2200,
+    "timeoutMs": 4000
+  },
+  "capture": {
+    "enabled": true,
+    "exchanges": 2,
+    "maxMemories": 5,
+    "minGapMs": 10000,
+    "model": null,
+    "contextChars": 7000,
+    "extraPrompt": ""
+  },
+  "sleep": {
+    "enabled": true,
+    "threshold": 30,
+    "minIntervalMs": 3600000,
+    "allSessions": true,
+    "force": false
+  },
+  "mcpHealth": {
+    "enabled": true,
+    "server": "mnemosyne",
+    "intervalMs": 90000,
+    "initialDelayMs": 60000,
+    "maxBackoffMs": 900000
+  },
+  "log": {
+    "recall": false,
+    "capture": true,
+    "sleep": true
+  }
+}
