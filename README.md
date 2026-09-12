@@ -15,6 +15,7 @@ v2 the same behaviour using OpenCode's own plugin API.
 | **Auto-recall** | `ctx.session.hook("context", …)` | Before a model call with a **new** user message, runs `mnemosyne_recall` and appends the best hits as a system part. Uses a short timeout so a slow server never blocks the turn. |
 | **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). |
 | **Auto-sleep** | periodic check (startup + every 15 min) | When unconsolidated working memory reaches `sleep.threshold`, runs `mnemosyne_sleep` so working memory can compress into the episodic/vector tier. |
+| **Guidance** | `ctx.session.hook("context")` | Injects a built-in Mnemosyne tool-usage guide as a system part, so the plugin carries its own instructions and no manual `AGENTS.md` section is needed. |
 | **MCP health** | `ctx.mcp.list` + local service API | Watches the MCP server's status and asks the host to reconnect it if it enters `failed` (OpenCode v2 does not retry a failed MCP connect on its own). |
 
 It talks to the **same Mnemosyne endpoint** you already configure as an MCP
@@ -103,7 +104,8 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "minScore": 0.12,
     "perMemoryChars": 400,
     "totalChars": 2200,
-    "timeoutMs": 4000
+    "timeoutMs": 4000,
+    "projectContext": true
   },
   "capture": {
     "enabled": true,
@@ -121,6 +123,7 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "allSessions": true,
     "force": false
   },
+  "guidance": { "enabled": true, "file": "", "text": "" },
   "mcpHealth": {
     "enabled": true,
     "server": "mnemosyne",
@@ -144,6 +147,7 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 | `perMemoryChars` | Per-memory character cap. |
 | `totalChars` | Total character budget for the injected block. |
 | `timeoutMs` | Abort a recall query after this long. Recall runs on the critical path, so it never retries; a slow server simply means no memory this turn. |
+| `projectContext` | Prefix the query with the workspace directory name so memories from other projects (the store is global) rank lower. Default `true`. |
 
 ### `capture`
 
@@ -174,6 +178,19 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 > note that force can make the server invoke its own LLM for summaries, so test
 > with a dry run first.
 
+### `guidance`
+
+The plugin carries its own Mnemosyne tool-usage instructions and injects them as
+a system part on each new user message, so you do **not** need to keep a
+Mnemosyne section in `AGENTS.md`. The text lives in the plugin (override it with
+`guidance.file` or `guidance.text` if you prefer).
+
+| Key | Meaning |
+|---|---|
+| `enabled` | Inject the guidance block. Set `false` if you supply your own instructions elsewhere. |
+| `file` | Optional path to a Markdown file whose contents replace the built-in text. |
+| `text` | Inline guidance text; overrides both `file` and the built-in text. |
+
 ### `mcpHealth`
 
 | Key | Meaning |
@@ -200,12 +217,15 @@ plugin `console.log` is not currently surfaced in the service log file.)
 | `MNEMOSYNE_RECALL_LIMIT` | `6` | Max memories per user message |
 | `MNEMOSYNE_RECALL_MIN_SCORE` | `0.12` | Hybrid-score cutoff for injection |
 | `MNEMOSYNE_RECALL_TIMEOUT_MS` | `4000` | Recall query timeout |
+| `MNEMOSYNE_RECALL_PROJECT_CONTEXT` | `true` | Prefix recall queries with the workspace directory name |
 | `MNEMOSYNE_CAPTURE` | `true` | `0`/`false` disables auto-capture |
 | `MNEMOSYNE_CAPTURE_MAX` | `5` | Max memories stored per exchange |
 | `MNEMOSYNE_CAPTURE_MODEL` | – | Summarizer `provider/model-id` |
 | `MNEMOSYNE_SLEEP` | `true` | `0`/`false` disables auto-sleep |
 | `MNEMOSYNE_SLEEP_THRESHOLD` | `30` | Unconsolidated working-memory threshold |
 | `MNEMOSYNE_SLEEP_ALL_SESSIONS` | `true` | Pass `all_sessions` to `mnemosyne_sleep` |
+| `MNEMOSYNE_GUIDANCE` | `true` | `0`/`false` disables the injected tool-usage guidance |
+| `MNEMOSYNE_GUIDANCE_FILE` | – | File whose contents replace the built-in guidance text |
 | `MNEMOSYNE_MCP_HEALTH` | `true` | `0`/`false` disables MCP health checks |
 | `MNEMOSYNE_MCP_SERVER` | `mnemosyne` | MCP server entry name |
 | `MNEMOSYNE_MCP_HEALTH_INTERVAL_MS` | `90000` | Healthy poll interval |
@@ -222,8 +242,9 @@ plugin `console.log` is not currently surfaced in the service log file.)
 - **Capture** runs shortly after a turn completes, looks at exchanges not yet
   processed (a per-session cursor is kept in plugin storage), asks the chosen
   LLM for a JSON array of durable memories, and stores each with
-  `scope=global`, a `source` category, importance, and
-  `metadata.tags: ["opencode", "auto-capture"]`.
+  `scope=global`, a `source` category, importance, `veracity: "inferred"`
+  (it is an extraction, not a direct quote), and
+  `metadata.tags: ["opencode", "auto-capture", "project:<dir>"]`.
 - Nothing is stored when the exchange contains nothing durable — the
   summarizer is instructed to return `[]` for chit-chat, transient commands,
   and rejected drafts.
@@ -236,6 +257,10 @@ plugin `console.log` is not currently surfaced in the service log file.)
 - If a session's cursor message falls out of the context window, capture
   re-examines only the most recent window rather than rewinding to the start of
   the transcript (which would re-capture old turns).
+- **Guidance** is injected once per new user message (not per tool
+  continuation), alongside recall. It is a fixed system part, so it costs a
+  small, constant amount of context per turn; disable it with
+  `guidance.enabled: false` if you keep the instructions in `AGENTS.md` instead.
 - Recall runs on its own client and never queues behind capture, sleep, or
   health checks. Sleep runs on its own client and uses a longer timeout.
 
