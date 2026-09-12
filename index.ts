@@ -52,6 +52,12 @@ interface PluginSettings {
      * a slow or unreachable server just means no memory is injected this turn.
      */
     timeoutMs: number
+    /**
+     * Prefix the recall query with the workspace directory name. The store is
+     * global and shared across projects, so this helps memories relevant to the
+     * current project outrank ones captured elsewhere.
+     */
+    projectContext: boolean
   }
   capture: {
     enabled: boolean
@@ -78,6 +84,18 @@ interface PluginSettings {
     allSessions: boolean
     /** Pass force (skip the age gate). Off by default. */
     force: boolean
+  }
+  /**
+   * Static tool-usage guidance injected as a system part on each new user
+   * message. This lets the plugin carry its own instructions (how and when to
+   * use the Mnemosyne tools) so a manual AGENTS.md section is unnecessary.
+   */
+  guidance: {
+    enabled: boolean
+    /** Optional file path; its contents replace the built-in text. */
+    file: string
+    /** Inline text; overrides both the file and the built-in text. */
+    text: string
   }
   /**
    * Keep the host's remote MCP connection alive. OpenCode v2 does not retry a
@@ -117,6 +135,7 @@ const DEFAULTS: PluginSettings = {
     perMemoryChars: 400,
     totalChars: 2200,
     timeoutMs: 4_000,
+    projectContext: true,
   },
   capture: {
     enabled: true,
@@ -137,6 +156,7 @@ const DEFAULTS: PluginSettings = {
     allSessions: true,
     force: false,
   },
+  guidance: { enabled: true, file: "", text: "" },
   // Independent of the sleep/recall/capture features: this is a reliability
   // mechanism, so it must keep working even if those are turned off.
   mcpHealth: {
@@ -281,6 +301,7 @@ function resolveSettings(): PluginSettings {
     if (typeof rec.perMemoryChars === "number") settings.recall.perMemoryChars = rec.perMemoryChars
     if (typeof rec.totalChars === "number") settings.recall.totalChars = rec.totalChars
     if (typeof rec.timeoutMs === "number") settings.recall.timeoutMs = rec.timeoutMs
+    if (typeof rec.projectContext === "boolean") settings.recall.projectContext = rec.projectContext
   }
   const cap = asObj(cfg?.capture)
   if (cap) {
@@ -299,6 +320,12 @@ function resolveSettings(): PluginSettings {
     if (typeof slp.minIntervalMs === "number") settings.sleep.minIntervalMs = slp.minIntervalMs
     if (typeof slp.allSessions === "boolean") settings.sleep.allSessions = slp.allSessions
     if (typeof slp.force === "boolean") settings.sleep.force = slp.force
+  }
+  const gd = asObj(cfg?.guidance)
+  if (gd) {
+    if (typeof gd.enabled === "boolean") settings.guidance.enabled = gd.enabled
+    if (typeof gd.file === "string") settings.guidance.file = gd.file
+    if (typeof gd.text === "string") settings.guidance.text = gd.text
   }
   const mh = asObj(cfg?.mcpHealth)
   if (mh) {
@@ -322,6 +349,7 @@ function resolveSettings(): PluginSettings {
   settings.recall.limit = num(process.env.MNEMOSYNE_RECALL_LIMIT, settings.recall.limit)
   settings.recall.minScore = num(process.env.MNEMOSYNE_RECALL_MIN_SCORE, settings.recall.minScore)
   settings.recall.timeoutMs = num(process.env.MNEMOSYNE_RECALL_TIMEOUT_MS, settings.recall.timeoutMs)
+  settings.recall.projectContext = bool(envOr("MNEMOSYNE_RECALL_PROJECT_CONTEXT"), settings.recall.projectContext)
   settings.capture.enabled = bool(envOr("MNEMOSYNE_CAPTURE"), settings.capture.enabled)
   settings.capture.maxMemories = num(process.env.MNEMOSYNE_CAPTURE_MAX, settings.capture.maxMemories)
   const capModel = envOr("MNEMOSYNE_CAPTURE_MODEL")
@@ -329,6 +357,9 @@ function resolveSettings(): PluginSettings {
   settings.sleep.enabled = bool(envOr("MNEMOSYNE_SLEEP"), settings.sleep.enabled)
   settings.sleep.threshold = num(process.env.MNEMOSYNE_SLEEP_THRESHOLD, settings.sleep.threshold)
   settings.sleep.allSessions = bool(envOr("MNEMOSYNE_SLEEP_ALL_SESSIONS"), settings.sleep.allSessions)
+  settings.guidance.enabled = bool(envOr("MNEMOSYNE_GUIDANCE"), settings.guidance.enabled)
+  const gdFile = envOr("MNEMOSYNE_GUIDANCE_FILE")
+  if (gdFile) settings.guidance.file = gdFile
   settings.mcpHealth.enabled = bool(process.env.MNEMOSYNE_MCP_HEALTH, settings.mcpHealth.enabled)
   settings.mcpHealth.intervalMs = num(process.env.MNEMOSYNE_MCP_HEALTH_INTERVAL_MS, settings.mcpHealth.intervalMs)
   settings.mcpHealth.initialDelayMs = num(process.env.MNEMOSYNE_MCP_HEALTH_INITIAL_MS, settings.mcpHealth.initialDelayMs)
@@ -623,6 +654,46 @@ function truncate(input: string, max: number): string {
   return `${input.slice(0, max)}…`
 }
 
+/** Final path segment of a workspace directory, for project-scoped recall/tags. */
+function projectLabel(directory: string | undefined): string {
+  if (!directory) return ""
+  const parts = directory.replace(/[\\/]+$/, "").split(/[\\/]/)
+  return parts[parts.length - 1] || ""
+}
+
+/**
+ * Built-in tool-usage guidance, injected so the plugin carries its own
+ * instructions. Keep this focused on strategy; per-tool parameter details live
+ * in the MCP tool schemas and should not be duplicated here.
+ */
+const DEFAULT_GUIDANCE = `Mnemosyne is your persistent memory (a BEAM store: working + episodic tiers, hybrid vector + FTS5 recall). An OpenCode plugin handles the automatic paths — recall is injected before each of your turns, completed exchanges are auto-captured, old working memory is consolidated (auto-sleep), and the MCP connection is kept alive. Do not duplicate those.
+
+Use the tools directly for what the auto path should not decide:
+- Remember after a durable fact, preference, correction, decision, identity detail, or goal. One fact per call, standalone sentence, scope='global' for anything that must surface in other sessions, importance >= 0.7 (preferences/identity 0.9+), a source category (preference|fact|insight|identity|decision|fix|task|event|project), a veracity (stated|inferred|tool|imported), and tags in metadata.tags. Never announce tool use; weave it in.
+- Canonical slots for single-source-of-truth facts: remember_canonical(category, name, body), recall_canonical(...), forget_canonical(category, name). Restating is a no-op; a new body supersedes and keeps history.
+- Correcting a fact: store the new one, then invalidate(memory_id=<old>, replacement_id=<new>).
+- Relational facts: triples for subject/predicate/object (triple_add / triple_query); graph edges to link two memories via graph_link(source_id, target_id, relationship) and graph_query(seed_memory_id, max_hops?, edge_type?, min_weight?). Note source_id/target_id and seed_memory_id — not from/to/memory_id.
+- "Forget X": recall to find the id, then forget(memory_id) (hard delete) or invalidate(memory_id) (keep history). Reply "Removed."
+- Maintenance: stats, diagnose (health), hygiene_audit / hygiene_clean (noise), export / import. Consolidation is automatic; call sleep yourself only after a very long session (all_sessions=true; dry_run=true to preview).
+
+Do not commit computation results, tool-call traces, drafts, or code the user has not accepted. Before calling an unfamiliar Mnemosyne tool, read its exact schema — the catalog may list only a few of the 29 tools.`
+
+/** Resolve guidance text: inline > file > built-in. */
+function loadGuidance(settings: PluginSettings): string {
+  const inline = settings.guidance.text.trim()
+  if (inline) return inline
+  const path = expandEnv(settings.guidance.file).trim()
+  if (path) {
+    try {
+      const text = loadFs().readFileSync(path, "utf8").trim()
+      if (text) return text
+    } catch {
+      // fall through to the built-in text
+    }
+  }
+  return DEFAULT_GUIDANCE
+}
+
 /* ------------------------------------------------------------------ *
  * Plugin
  * ------------------------------------------------------------------ */
@@ -720,10 +791,14 @@ export default {
           seenUserMessages.add(key)
           if (seenUserMessages.size > 20_000) seenUserMessages.clear()
 
+          const label = settings.recall.projectContext ? projectLabel(ctx.location?.directory) : ""
+          const query = label
+            ? `Project: ${label}\n${truncate(userMsg.text, 1200)}`
+            : truncate(userMsg.text, 1200)
           const res = (await recallClient.call(
             "mnemosyne_recall",
             {
-              query: truncate(userMsg.text, 1200),
+              query,
               limit: settings.recall.limit,
             },
             // Short budget, no retry: never let memory lookup hold up a turn.
@@ -763,6 +838,35 @@ export default {
           }
         } catch (err) {
           if (settings.debug) warn(`recall hook error: ${err instanceof Error ? err.message : err}`)
+        }
+      })
+      disposables.push(registration)
+    }
+
+    /* ---------------- 1b. GUIDANCE (native tool-usage injection) ---------- */
+
+    // The plugin carries its own Mnemosyne instructions so no manual AGENTS.md
+    // section is needed. Injected once per new user message, like recall, so it
+    // is present on every turn the model might act on.
+    const guidanceText = settings.guidance.enabled ? loadGuidance(settings) : ""
+    if (guidanceText) {
+      const seenGuidance = new Set<string>()
+      const registration = await ctx.session.hook("context", async (event) => {
+        try {
+          const userMsg = lastUserMessage((event.messages ?? []) as Loose[])
+          if (!userMsg || !userMsg.text.trim()) return
+          const key = `${event.sessionID}:${userMsg.id}`
+          if (seenGuidance.has(key)) return
+          seenGuidance.add(key)
+          if (seenGuidance.size > 20_000) seenGuidance.clear()
+          event.system.push({ type: "text", text: `# Mnemosyne memory usage\n${guidanceText}` })
+          if (settings.debug) {
+            void client.call("mnemosyne_scratchpad_write", {
+              content: `[opencode.mnemosyne] guidance injected ${event.sessionID} at ${new Date().toISOString()}`,
+            })
+          }
+        } catch (err) {
+          if (settings.debug) warn(`guidance hook error: ${err instanceof Error ? err.message : err}`)
         }
       })
       disposables.push(registration)
@@ -1084,11 +1188,14 @@ class CaptureRunner {
       ? memory.tags.filter((t: unknown): t is string => typeof t === "string").slice(0, 6)
       : []
     tags.push("opencode", "auto-capture")
+    const label = projectLabel(this.ctx.location?.directory)
+    if (label) tags.push(`project:${label}`)
     await this.client.call("mnemosyne_remember", {
       content,
       importance,
       source: normalizeType(memory.type), // this server uses `source` as the category label
       scope: "global", // durable facts must surface across sessions
+      veracity: "inferred", // LLM-extracted from the transcript, not a direct quote
       metadata: { tags: [...new Set(tags)] },
     })
   }

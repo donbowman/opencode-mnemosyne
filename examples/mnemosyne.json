@@ -9,7 +9,8 @@
     "minScore": 0.12,
     "perMemoryChars": 400,
     "totalChars": 2200,
-    "timeoutMs": 4000
+    "timeoutMs": 4000,
+    "projectContext": true
   },
   "capture": {
     "enabled": true,
@@ -27,6 +28,7 @@
     "allSessions": true,
     "force": false
   },
+  "guidance": { "enabled": true, "file": "", "text": "" },
   "mcpHealth": {
     "enabled": true,
     "server": "mnemosyne",
