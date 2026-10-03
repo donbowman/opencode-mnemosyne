@@ -19,6 +19,14 @@
  *                      extra API key) and stores the extracted durable facts in
  *                      Mnemosyne (mnemosyne_remember, scope=global).
  *
+ *   3. COMPACTION CAPTURE — a session `compaction` hook runs before every
+ *                      checkpoint summary, automatic or user-triggered
+ *                      (/compact). It forces one bounded capture pass over the
+ *                      transcript that is about to be replaced, so durable
+ *                      facts are distilled to Mnemosyne before those messages
+ *                      leave the context window. Fail-open and time-boxed: it
+ *                      never blocks compaction past its configured budget.
+ *
  * Configuration precedence: defaults < ~/.config/opencode/mnemosyne.json
  * < environment variables (MNEMOSYNE_*). The bearer token is resolved from
  * MNEMOSYNE_API_KEY, the config file, or — when neither is set — from the
@@ -73,6 +81,20 @@ interface PluginSettings {
     contextChars: number
     /** Extra system guidance appended to the summarizer prompt. */
     extraPrompt: string
+    /**
+     * Force a capture pass when OpenCode compacts the session (automatic or
+     * `/compact`), before older messages are replaced by the summary. This is
+     * the last chance to extract durable facts from exchanges the periodic
+     * capture has not seen yet.
+     */
+    onCompaction: boolean
+    /** Max exchanges looked back on one compaction capture. */
+    compactionExchanges: number
+    /**
+     * Total time budget for one compaction capture. Compaction waits for the
+     * capture, so this bounds how long it can be delayed.
+     */
+    compactionTimeoutMs: number
   }
   sleep: {
     enabled: boolean
@@ -145,6 +167,9 @@ const DEFAULTS: PluginSettings = {
     model: null,
     contextChars: 7000,
     extraPrompt: "",
+    onCompaction: true,
+    compactionExchanges: 12,
+    compactionTimeoutMs: 20_000,
   },
   // Mirrors the Hermes `auto_sleep` behaviour (mnemosyne provider): run the
   // consolidation cycle once working memory accumulates past a threshold so
@@ -312,6 +337,9 @@ function resolveSettings(): PluginSettings {
     if (typeof cap.model === "string") settings.capture.model = cap.model
     if (typeof cap.contextChars === "number") settings.capture.contextChars = cap.contextChars
     if (typeof cap.extraPrompt === "string") settings.capture.extraPrompt = cap.extraPrompt
+    if (typeof cap.onCompaction === "boolean") settings.capture.onCompaction = cap.onCompaction
+    if (typeof cap.compactionExchanges === "number") settings.capture.compactionExchanges = cap.compactionExchanges
+    if (typeof cap.compactionTimeoutMs === "number") settings.capture.compactionTimeoutMs = cap.compactionTimeoutMs
   }
   const slp = asObj(cfg?.sleep)
   if (slp) {
@@ -352,6 +380,15 @@ function resolveSettings(): PluginSettings {
   settings.recall.projectContext = bool(envOr("MNEMOSYNE_RECALL_PROJECT_CONTEXT"), settings.recall.projectContext)
   settings.capture.enabled = bool(envOr("MNEMOSYNE_CAPTURE"), settings.capture.enabled)
   settings.capture.maxMemories = num(process.env.MNEMOSYNE_CAPTURE_MAX, settings.capture.maxMemories)
+  settings.capture.onCompaction = bool(envOr("MNEMOSYNE_CAPTURE_ON_COMPACTION"), settings.capture.onCompaction)
+  settings.capture.compactionExchanges = num(
+    process.env.MNEMOSYNE_CAPTURE_COMPACTION_MAX,
+    settings.capture.compactionExchanges,
+  )
+  settings.capture.compactionTimeoutMs = num(
+    process.env.MNEMOSYNE_CAPTURE_COMPACTION_TIMEOUT_MS,
+    settings.capture.compactionTimeoutMs,
+  )
   const capModel = envOr("MNEMOSYNE_CAPTURE_MODEL")
   if (capModel) settings.capture.model = capModel
   settings.sleep.enabled = bool(envOr("MNEMOSYNE_SLEEP"), settings.sleep.enabled)
@@ -710,7 +747,10 @@ interface SetupContext {
     workspaceID?: string
   }
   session: {
-    hook(name: "context", callback: (event: Loose) => Promise<void> | void): Promise<{ dispose(): Promise<void> }>
+    hook(
+      name: "context" | "compaction",
+      callback: (event: Loose) => Promise<void> | void,
+    ): Promise<{ dispose(): Promise<void> }>
     get(input: { sessionID: string }): Promise<Loose>
     context(input: { sessionID: string }): Promise<unknown>
   }
@@ -875,8 +915,11 @@ export default {
     /* ---------------- 2. AUTO-CAPTURE (session.idle events) --------------- */
 
     const controller = new AbortController()
-    if (settings.capture.enabled) {
-      const capturer = new CaptureRunner(ctx as unknown as CtxLike, client, settings, log, warn)
+    const capturer = settings.capture.enabled
+      ? new CaptureRunner(ctx as unknown as CtxLike, client, settings, log, warn)
+      : null
+    if (capturer) {
+      const capture = capturer
       // The plugin loads once per location; only this instance's project
       // sessions are captured (checked inside CaptureRunner.run).
       const loop = (async () => {
@@ -889,7 +932,7 @@ export default {
             const statusIdle = type === "session.status" && e.data?.status?.type === "idle"
             if (!(type === "session.execution.succeeded" || type === "session.idle" || statusIdle)) continue
             const sessionID = e.data?.sessionID ?? e.sessionID
-            if (typeof sessionID === "string") void capturer.run(sessionID)
+            if (typeof sessionID === "string") void capture.run(sessionID)
           } catch {
             // ignore malformed events
           }
@@ -900,6 +943,32 @@ export default {
           warn(`event loop ended: ${err instanceof Error ? err.message : err}`)
         }
       })
+    }
+
+    /* ---------------- 2b. COMPACTION CAPTURE (distill before summary) ------ */
+
+    // OpenCode's `compaction` session hook runs for EVERY checkpoint summary —
+    // automatic and user-triggered (/compact) — and receives the transcript
+    // that is about to be replaced, before OpenCode appends its summary prompt.
+    // Force one bounded capture pass over the uncaptured tail so durable facts
+    // reach Mnemosyne before those messages leave the context window. The hook
+    // is fail-open: a capture failure or timeout must not block compaction.
+    if (capturer && settings.capture.onCompaction) {
+      const capture = capturer
+      const registration = await ctx.session.hook("compaction", async (event) => {
+        try {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : ""
+          if (!sessionID) {
+            if (settings.debug) warn("compaction hook fired without a sessionID; skipping capture")
+            return
+          }
+          const messages = Array.isArray(event?.messages) ? (event.messages as Loose[]) : []
+          await capture.captureBeforeCompaction(sessionID, messages)
+        } catch (err) {
+          warn(`compaction capture error: ${err instanceof Error ? err.message : err}`)
+        }
+      })
+      disposables.push(registration)
     }
 
     /* ---------------- 3. AUTO-SLEEP (working → episodic consolidation) --------- */
@@ -1043,6 +1112,69 @@ class CaptureRunner {
       })
     }
     if (!Array.isArray(messages) || messages.length === 0) return
+    await this.captureMessages(sessionID, messages, {
+      maxExchanges: this.settings.capture.exchanges,
+      deadline: 0,
+      extraTags: [],
+      reason: "idle",
+    })
+  }
+
+  /**
+   * Forced capture for the compaction hook: `messages` is the transcript
+   * OpenCode is about to replace with a summary, so this is the last chance to
+   * extract durable facts from exchanges the periodic capture has not seen.
+   *
+   * Unlike `run`, this bypasses the per-session gap and is bounded by
+   * `capture.compactionExchanges` and `capture.compactionTimeoutMs`. It never
+   * throws: compaction must proceed even when Mnemosyne is unreachable.
+   */
+  async captureBeforeCompaction(sessionID: string, messages: Loose[]): Promise<void> {
+    const budget = Math.max(1_000, this.settings.capture.compactionTimeoutMs)
+    if (this.running.has(sessionID)) {
+      // A periodic capture is already reading the same pre-compaction context;
+      // give it a moment to finish so the cursor stays contiguous.
+      const waitUntil = Date.now() + Math.min(5_000, budget)
+      while (this.running.has(sessionID) && Date.now() < waitUntil) await sleep(100)
+      if (this.running.has(sessionID)) {
+        this.warn(`compaction capture skipped for ${sessionID}: a capture is still running`)
+        return
+      }
+    }
+    this.running.add(sessionID)
+    try {
+      // The hook normally supplies the transcript being summarized; fall back
+      // to the live context if the event carried none.
+      let snapshot = messages
+      if (!Array.isArray(snapshot) || snapshot.length === 0) {
+        snapshot = ((await this.ctx.session.context({ sessionID })) as Loose[] | undefined) ?? []
+      }
+      await this.captureMessages(sessionID, snapshot, {
+        maxExchanges: this.settings.capture.compactionExchanges,
+        deadline: Date.now() + budget,
+        extraTags: ["pre-compaction"],
+        reason: "compaction",
+      })
+    } catch (err) {
+      this.warn(`compaction capture failed for ${sessionID}: ${err instanceof Error ? err.message : err}`)
+    } finally {
+      this.running.delete(sessionID)
+    }
+  }
+
+  /**
+   * Shared capture pass: walk the uncaptured tail of `messages` oldest-first,
+   * summarize each exchange, store the extracted memories, and advance the
+   * per-session cursor. `deadline` (0 = none) bounds the loop; the cursor only
+   * advances past exchanges that were actually attempted, so a bounded pass
+   * can be resumed by the next one while the messages are still in context.
+   */
+  private async captureMessages(
+    sessionID: string,
+    messages: Loose[],
+    opts: { maxExchanges: number; deadline: number; extraTags: string[]; reason: string },
+  ): Promise<void> {
+    if (!Array.isArray(messages) || messages.length === 0) return
 
     const cursorKey = `opencode-mnemosyne/cursor/${sessionID}`
     const cursor = await this.ctx.storage.get<string>(cursorKey)
@@ -1062,23 +1194,24 @@ class CaptureRunner {
     }
     if (start >= messages.length) return
 
-    const exchanges = this.buildExchanges(messages, start, !cursorFound)
+    const exchanges = this.buildExchanges(messages, start, !cursorFound, opts.maxExchanges)
     if (exchanges.length === 0) return
 
     // Process oldest-first so the cursor stays contiguous when capped.
-    const limit = Math.max(1, this.settings.capture.exchanges)
+    const limit = Math.max(1, opts.maxExchanges)
     const toProcess = exchanges.slice(0, limit)
 
     let lastProcessedID: string | undefined
     let storedTotal = 0
     for (const exchange of toProcess) {
+      if (opts.deadline > 0 && Date.now() >= opts.deadline) break
       lastProcessedID = exchange.assistantIds[exchange.assistantIds.length - 1] ?? exchange.userId
       const text = this.formatExchange(exchange, this.settings.capture.contextChars)
       if (!text.trim()) continue
       const memories = await this.summarize(sessionID, text)
       for (const memory of memories.slice(0, this.settings.capture.maxMemories)) {
         try {
-          await this.storeMemory(memory)
+          await this.storeMemory(memory, opts.extraTags)
           storedTotal += 1
         } catch (err) {
           this.warn(`store failed: ${err instanceof Error ? err.message : err}`)
@@ -1088,16 +1221,16 @@ class CaptureRunner {
 
     if (lastProcessedID) await this.ctx.storage.set(cursorKey, lastProcessedID)
     if (this.settings.log.capture && storedTotal > 0) {
-      this.log(`captured ${storedTotal} memory(ies) from ${sessionID} (${toProcess.length} exchange(s))`)
+      this.log(`captured ${storedTotal} memory(ies) from ${sessionID} (${toProcess.length} exchange(s), ${opts.reason})`)
     }
     if (this.settings.debug) {
       void this.client.call("mnemosyne_scratchpad_write", {
-        content: `[opencode.mnemosyne] capture ${sessionID}: ${toProcess.length} exchange(s), stored ${storedTotal} at ${new Date().toISOString()}`,
+        content: `[opencode.mnemosyne] capture ${opts.reason} ${sessionID}: ${toProcess.length} exchange(s), stored ${storedTotal} at ${new Date().toISOString()}`,
       })
     }
   }
 
-  private buildExchanges(messages: Loose[], start: number, firstRun: boolean): Exchange[] {
+  private buildExchanges(messages: Loose[], start: number, firstRun: boolean, firstRunLimit?: number): Exchange[] {
     const exchanges: Exchange[] = []
     let current: Exchange | null = null
     for (let i = start; i < messages.length; i++) {
@@ -1118,7 +1251,7 @@ class CaptureRunner {
     }
     if (current) exchanges.push(current)
     // On the very first run after enabling the plugin, only consider recent pairs.
-    return firstRun ? exchanges.slice(-Math.max(1, this.settings.capture.exchanges)) : exchanges
+    return firstRun ? exchanges.slice(-Math.max(1, firstRunLimit ?? this.settings.capture.exchanges)) : exchanges
   }
 
   private formatExchange(exchange: Exchange, contextChars: number): string {
@@ -1179,7 +1312,7 @@ class CaptureRunner {
     return null
   }
 
-  private async storeMemory(memory: Loose): Promise<void> {
+  private async storeMemory(memory: Loose, extraTags: string[] = []): Promise<void> {
     const content = typeof memory.content === "string" ? memory.content.trim() : ""
     if (!content) return
     let importance = typeof memory.importance === "number" ? memory.importance : 0.6
@@ -1187,7 +1320,7 @@ class CaptureRunner {
     const tags = Array.isArray(memory.tags)
       ? memory.tags.filter((t: unknown): t is string => typeof t === "string").slice(0, 6)
       : []
-    tags.push("opencode", "auto-capture")
+    tags.push("opencode", "auto-capture", ...extraTags)
     const label = projectLabel(this.ctx.location?.directory)
     if (label) tags.push(`project:${label}`)
     await this.client.call("mnemosyne_remember", {

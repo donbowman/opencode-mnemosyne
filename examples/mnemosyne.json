@@ -19,7 +19,10 @@
     "minGapMs": 10000,
     "model": null,
     "contextChars": 7000,
-    "extraPrompt": ""
+    "extraPrompt": "",
+    "onCompaction": true,
+    "compactionExchanges": 12,
+    "compactionTimeoutMs": 20000
   },
   "sleep": {
     "enabled": true,

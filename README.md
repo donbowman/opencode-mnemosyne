@@ -14,6 +14,7 @@ v2 the same behaviour using OpenCode's own plugin API.
 |---|---|---|
 | **Auto-recall** | `ctx.session.hook("context", …)` | Before a model call with a **new** user message, runs `mnemosyne_recall` and appends the best hits as a system part. Uses a short timeout so a slow server never blocks the turn. |
 | **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). |
+| **Compaction capture** | `ctx.session.hook("compaction", …)` | Before every checkpoint summary (automatic or `/compact`), forces one bounded capture pass over the transcript that is about to be replaced, so durable facts reach Mnemosyne before those messages leave the context window. Fail-open and time-boxed. |
 | **Auto-sleep** | periodic check (startup + every 15 min) | When unconsolidated working memory reaches `sleep.threshold`, runs `mnemosyne_sleep` so working memory can compress into the episodic/vector tier. |
 | **Guidance** | `ctx.session.hook("context")` | Injects a built-in Mnemosyne tool-usage guide as a system part, so the plugin carries its own instructions and no manual `AGENTS.md` section is needed. |
 | **MCP health** | `ctx.mcp.list` + local service API | Watches the MCP server's status and asks the host to reconnect it if it enters `failed` (OpenCode v2 does not retry a failed MCP connect on its own). |
@@ -50,7 +51,7 @@ opencode2 service restart
 
 The plugin has **no runtime dependencies** — `index.ts` is dependency-free and
 the host executes it as-is. `package.json` and `tsconfig.json` exist only for
-editor/type-checking (`npm install && npm run typecheck`).
+editor/type-checking and the smoke test (`npm install && npm test`).
 
 Alternatively, reference the directory explicitly from `opencode.jsonc`:
 
@@ -114,7 +115,10 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "minGapMs": 10000,
     "model": null,
     "contextChars": 7000,
-    "extraPrompt": ""
+    "extraPrompt": "",
+    "onCompaction": true,
+    "compactionExchanges": 12,
+    "compactionTimeoutMs": 20000
   },
   "sleep": {
     "enabled": true,
@@ -160,6 +164,20 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 | `model` | Optional summarizer model `provider/model-id`; defaults to the session's own model. |
 | `contextChars` | Character budget handed to the summarizer for one exchange. |
 | `extraPrompt` | Extra system guidance appended to the summarizer prompt. |
+| `onCompaction` | Force a capture pass when the session is compacted (automatic or `/compact`), before older messages are replaced by the summary. Default `true`. |
+| `compactionExchanges` | Max exchanges looked back on one compaction capture. Default `12`. |
+| `compactionTimeoutMs` | Total budget for one compaction capture; bounds how long compaction can be delayed. Default `20000`. |
+
+> **Compaction capture is the safety net for the context window.** OpenCode's
+> per-turn capture normally keeps up, but anything not captured before older
+> messages are dropped by compaction can no longer be read from the transcript.
+> The `compaction` hook runs before the summary is generated, bypasses the
+> per-session capture gap, and processes the uncaptured tail (oldest first, up
+> to `compactionExchanges`, within `compactionTimeoutMs`). Memories stored from
+> this path carry the extra tag `pre-compaction`. The hook never throws: if
+> Mnemosyne is unreachable or the budget is exceeded, the normal compaction
+> cycle still runs. Note that compaction waits for this pass, so keep
+> `compactionTimeoutMs` modest on slow connections.
 
 ### `sleep`
 
@@ -221,6 +239,9 @@ plugin `console.log` is not currently surfaced in the service log file.)
 | `MNEMOSYNE_CAPTURE` | `true` | `0`/`false` disables auto-capture |
 | `MNEMOSYNE_CAPTURE_MAX` | `5` | Max memories stored per exchange |
 | `MNEMOSYNE_CAPTURE_MODEL` | – | Summarizer `provider/model-id` |
+| `MNEMOSYNE_CAPTURE_ON_COMPACTION` | `true` | `0`/`false` disables the pre-compaction capture pass |
+| `MNEMOSYNE_CAPTURE_COMPACTION_MAX` | `12` | Max exchanges looked back on one compaction capture |
+| `MNEMOSYNE_CAPTURE_COMPACTION_TIMEOUT_MS` | `20000` | Budget for one compaction capture |
 | `MNEMOSYNE_SLEEP` | `true` | `0`/`false` disables auto-sleep |
 | `MNEMOSYNE_SLEEP_THRESHOLD` | `30` | Unconsolidated working-memory threshold |
 | `MNEMOSYNE_SLEEP_ALL_SESSIONS` | `true` | Pass `all_sessions` to `mnemosyne_sleep` |
@@ -248,6 +269,13 @@ plugin `console.log` is not currently surfaced in the service log file.)
 - Nothing is stored when the exchange contains nothing durable — the
   summarizer is instructed to return `[]` for chit-chat, transient commands,
   and rejected drafts.
+- **Compaction capture** runs inside OpenCode's `compaction` hook for every
+  checkpoint summary (automatic or `/compact`) and forces one capture pass over
+  the transcript that is about to be replaced. It bypasses the normal capture
+  gap, is bounded by `capture.compactionExchanges` and
+  `capture.compactionTimeoutMs`, and tags its memories `pre-compaction`. The
+  hook never throws and never sets a compaction result: OpenCode's own summary
+  is generated as usual afterwards.
 - The plugin is loaded once **per project location**, and every instance sees
   the same broadcast events. Capture checks the session's `projectID` against
   the instance's own project and uses a jittered settle delay plus a stored
@@ -256,7 +284,10 @@ plugin `console.log` is not currently surfaced in the service log file.)
   more than once. Set `capture.minGapMs` higher if you see duplicates.
 - If a session's cursor message falls out of the context window, capture
   re-examines only the most recent window rather than rewinding to the start of
-  the transcript (which would re-capture old turns).
+  the transcript (which would re-capture old turns). Compaction capture is what
+  makes the pre-compaction tail the last chance to capture those exchanges, so
+  leave `capture.onCompaction` enabled if durable memory matters more than a
+  few seconds of compaction delay.
 - **Guidance** is injected once per new user message (not per tool
   continuation), alongside recall. It is a fixed system part, so it costs a
   small, constant amount of context per turn; disable it with
@@ -276,10 +307,13 @@ plugin `console.log` is not currently surfaced in the service log file.)
    earlier captured memory. If the model answers using it without you
    prompting, injection is working. You can also watch a memory's
    `recall_count` increase on the server.
-4. **Sleep**: `mnemosyne_stats` should show `beam.episodic_memory.total > 0`
+4. **Compaction**: run `/compact` (or wait for automatic compaction) and check
+   that the store grew by memories tagged `pre-compaction`. If nothing was
+   uncaptured, the pass is a no-op.
+5. **Sleep**: `mnemosyne_stats` should show `beam.episodic_memory.total > 0`
    once consolidation has run. If it never grows while
    `working_memory.unconsolidated` is high, see the auto-sleep note above.
-5. Tuning: edit `~/.config/opencode/mnemosyne.json` and touch `index.ts` — the
+6. Tuning: edit `~/.config/opencode/mnemosyne.json` and touch `index.ts` — the
    watcher reloads the plugin.
 
 ## Troubleshooting
@@ -301,6 +335,26 @@ plugin `console.log` is not currently surfaced in the service log file.)
   recall works best once older memories are consolidated).
 - **Recall adds latency** — lower `recall.timeoutMs`; the hooks already skip
   injection on timeout rather than retrying.
+
+## Development
+
+`package.json` and `tsconfig.json` are dev-only; the plugin itself has no
+runtime dependencies.
+
+```sh
+npm install
+npm run typecheck   # tsc --noEmit
+npm run smoke       # node --experimental-transform-types test/smoke.ts
+npm test            # typecheck + smoke
+```
+
+`test/smoke.ts` runs the plugin against a mock OpenCode setup context and a
+mock Mnemosyne MCP server. It covers the pre-compaction capture path (memories
+stored, tagged `pre-compaction`, cursor advanced, repeat runs are no-ops) and
+keeps the hook fail-open when the endpoint is unreachable. The
+`--experimental-transform-types` flag is needed because the plugin uses
+TypeScript parameter properties, which Node's default type stripping does not
+transform.
 
 ## Security notes
 
