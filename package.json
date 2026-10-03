@@ -23,7 +23,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "node --experimental-transform-types test/smoke.ts",
+    "test": "npm run typecheck && npm run smoke"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
