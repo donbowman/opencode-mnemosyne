@@ -13,11 +13,14 @@
  *
  *   2. AUTO-CAPTURE  — when a user turn completes (this build publishes
  *                      `session.execution.succeeded`; `session.idle` and idle
- *                      `session.status` are handled as fallbacks) it summarises
- *                      the finished exchange with an LLM (reusing the OpenCode
- *                      provider already authenticated for that session — no
- *                      extra API key) and stores the extracted durable facts in
- *                      Mnemosyne (mnemosyne_remember, scope=global).
+ *                      `session.status` are handled as fallbacks, and a
+ *                      `session.execution.interrupted` with reason `user` or
+ *                      `superseded` captures the tail of a turn that never
+ *                      succeeded) it summarises the finished exchange with an
+ *                      LLM (reusing the OpenCode provider already authenticated
+ *                      for that session — no extra API key) and stores the
+ *                      extracted durable facts in Mnemosyne
+ *                      (mnemosyne_remember, scope=global).
  *
  *   3. COMPACTION CAPTURE — a session `compaction` hook runs before every
  *                      checkpoint summary, automatic or user-triggered
@@ -98,6 +101,15 @@ interface PluginSettings {
      * capture has not seen yet.
      */
     onCompaction: boolean
+    /**
+     * Capture when a turn is interrupted by the user (escape / stop) or
+     * superseded by a new prompt (steer), as well as when it succeeds. An
+     * interrupted turn ends without a `session.execution.succeeded` event, so
+     * its tail would otherwise never reach Mnemosyne. Shutdown and inactivity
+     * interruptions are always ignored: the server or this plugin's location is
+     * going away and a capture could not finish.
+     */
+    onInterrupt: boolean
     /** Max exchanges looked back on one compaction capture. */
     compactionExchanges: number
     /**
@@ -200,6 +212,7 @@ const DEFAULTS: PluginSettings = {
     contextChars: 7000,
     extraPrompt: "",
     onCompaction: true,
+    onInterrupt: true,
     compactionExchanges: 12,
     compactionTimeoutMs: 20_000,
   },
@@ -371,6 +384,7 @@ function resolveSettings(): PluginSettings {
     if (typeof cap.contextChars === "number") settings.capture.contextChars = cap.contextChars
     if (typeof cap.extraPrompt === "string") settings.capture.extraPrompt = cap.extraPrompt
     if (typeof cap.onCompaction === "boolean") settings.capture.onCompaction = cap.onCompaction
+    if (typeof cap.onInterrupt === "boolean") settings.capture.onInterrupt = cap.onInterrupt
     if (typeof cap.compactionExchanges === "number") settings.capture.compactionExchanges = cap.compactionExchanges
     if (typeof cap.compactionTimeoutMs === "number") settings.capture.compactionTimeoutMs = cap.compactionTimeoutMs
   }
@@ -422,6 +436,7 @@ function resolveSettings(): PluginSettings {
   settings.capture.enabled = bool(envOr("MNEMOSYNE_CAPTURE"), settings.capture.enabled)
   settings.capture.maxMemories = num(process.env.MNEMOSYNE_CAPTURE_MAX, settings.capture.maxMemories)
   settings.capture.onCompaction = bool(envOr("MNEMOSYNE_CAPTURE_ON_COMPACTION"), settings.capture.onCompaction)
+  settings.capture.onInterrupt = bool(envOr("MNEMOSYNE_CAPTURE_ON_INTERRUPT"), settings.capture.onInterrupt)
   settings.capture.compactionExchanges = num(
     process.env.MNEMOSYNE_CAPTURE_COMPACTION_MAX,
     settings.capture.compactionExchanges,
@@ -1050,9 +1065,23 @@ export default {
             // This build emits session.execution.succeeded when a user turn
             // completes (session.idle / session.status are not published).
             const statusIdle = type === "session.status" && e.data?.status?.type === "idle"
-            if (!(type === "session.execution.succeeded" || type === "session.idle" || statusIdle)) continue
+            // A turn that ends without succeeding still has a tail worth
+            // keeping: the user pressed escape/stop (`reason: "user"`), or a
+            // new prompt superseded the running turn (`reason: "superseded"`).
+            // No `succeeded` event follows either one, so without this branch
+            // those exchanges would never reach Mnemosyne. `shutdown` and
+            // `inactivity` are excluded: the server (or this location) is going
+            // away, so the summarizer + store round trip cannot complete.
+            const reason = typeof e.data?.reason === "string" ? e.data.reason : ""
+            const interrupted =
+              settings.capture.onInterrupt &&
+              type === "session.execution.interrupted" &&
+              (reason === "user" || reason === "superseded")
+            if (!(type === "session.execution.succeeded" || type === "session.idle" || statusIdle || interrupted)) {
+              continue
+            }
             const sessionID = e.data?.sessionID ?? e.sessionID
-            if (typeof sessionID === "string") void capture.run(sessionID)
+            if (typeof sessionID === "string") void capture.run(sessionID, interrupted ? "interrupt" : "idle")
           } catch {
             // ignore malformed events
           }
@@ -1276,7 +1305,7 @@ class CaptureRunner {
     private readonly warn: (...args: unknown[]) => void,
   ) {}
 
-  async run(sessionID: string): Promise<void> {
+  async run(sessionID: string, reason = "idle"): Promise<void> {
     if (this.running.has(sessionID)) return
     // The plugin loads once per location/project. Capture only sessions that
     // belong to THIS instance's project so each session is captured exactly
@@ -1296,7 +1325,7 @@ class CaptureRunner {
     this.running.add(sessionID)
     this.lastRun.set(sessionID, Date.now())
     try {
-      await this.doCapture(sessionID)
+      await this.doCapture(sessionID, reason)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       this.warn(`capture failed for ${sessionID}: ${msg}`)
@@ -1310,7 +1339,7 @@ class CaptureRunner {
     }
   }
 
-  private async doCapture(sessionID: string): Promise<void> {
+  private async doCapture(sessionID: string, reason: string): Promise<void> {
     // Small settle delay (jittered) so the final assistant message is persisted
     // and concurrent instances rarely collide.
     await sleep(1200 + Math.random() * 1300)
@@ -1318,7 +1347,7 @@ class CaptureRunner {
     const messages = (await this.ctx.session.context({ sessionID })) as Loose[] | undefined
     if (this.settings.debug) {
       void this.client.call("mnemosyne_scratchpad_write", {
-        content: `[opencode.mnemosyne] capture start ${sessionID} own=${this.ctx.location?.directory ?? "?"} messages=${Array.isArray(messages) ? messages.length : "n/a"} at ${new Date().toISOString()}`,
+        content: `[opencode.mnemosyne] capture start ${sessionID} reason=${reason} own=${this.ctx.location?.directory ?? "?"} messages=${Array.isArray(messages) ? messages.length : "n/a"} at ${new Date().toISOString()}`,
       })
     }
     if (!Array.isArray(messages) || messages.length === 0) return
@@ -1326,7 +1355,7 @@ class CaptureRunner {
       maxExchanges: this.settings.capture.exchanges,
       deadline: 0,
       extraTags: [],
-      reason: "idle",
+      reason,
     })
   }
 
