@@ -27,6 +27,12 @@
  *                      leave the context window. Fail-open and time-boxed: it
  *                      never blocks compaction past its configured budget.
  *
+ *   4. /handoff COMMAND — a user-invoked shorthand for the end-of-session
+ *                      ritual. It submits one turn asking the model to distil
+ *                      its learnings into Mnemosyne and leave a handoff note,
+ *                      then queues a compaction so the note is folded into the
+ *                      summary while it is still present in the transcript.
+ *
  * Configuration precedence: defaults < ~/.config/opencode/mnemosyne.json
  * < environment variables (MNEMOSYNE_*). The bearer token is resolved from
  * MNEMOSYNE_API_KEY, the config file, or — when neither is set — from the
@@ -120,6 +126,19 @@ interface PluginSettings {
     text: string
   }
   /**
+   * The `/handoff` command: a user-invoked shorthand for the end-of-session
+   * ritual. It submits one turn that asks the model to distil its learnings
+   * into Mnemosyne and leave a handoff note, then queues a compaction so the
+   * note is folded into the summary while it is still in the transcript.
+   */
+  handoff: {
+    enabled: boolean
+    /** Inline text replacing the built-in instruction. Empty uses the default. */
+    instruction: string
+    /** Also request compaction once the handoff turn has been submitted. */
+    compact: boolean
+  }
+  /**
    * Keep the host's remote MCP connection alive. OpenCode v2 does not retry a
    * failed MCP connect, so a transient TLS/network blip leaves the server
    * stuck in `failed`. This tick watches the status and asks the host to
@@ -182,6 +201,7 @@ const DEFAULTS: PluginSettings = {
     force: false,
   },
   guidance: { enabled: true, file: "", text: "" },
+  handoff: { enabled: true, instruction: "", compact: true },
   // Independent of the sleep/recall/capture features: this is a reliability
   // mechanism, so it must keep working even if those are turned off.
   mcpHealth: {
@@ -355,6 +375,12 @@ function resolveSettings(): PluginSettings {
     if (typeof gd.file === "string") settings.guidance.file = gd.file
     if (typeof gd.text === "string") settings.guidance.text = gd.text
   }
+  const ho = asObj(cfg?.handoff)
+  if (ho) {
+    if (typeof ho.enabled === "boolean") settings.handoff.enabled = ho.enabled
+    if (typeof ho.instruction === "string") settings.handoff.instruction = ho.instruction
+    if (typeof ho.compact === "boolean") settings.handoff.compact = ho.compact
+  }
   const mh = asObj(cfg?.mcpHealth)
   if (mh) {
     if (typeof mh.enabled === "boolean") settings.mcpHealth.enabled = mh.enabled
@@ -397,6 +423,10 @@ function resolveSettings(): PluginSettings {
   settings.guidance.enabled = bool(envOr("MNEMOSYNE_GUIDANCE"), settings.guidance.enabled)
   const gdFile = envOr("MNEMOSYNE_GUIDANCE_FILE")
   if (gdFile) settings.guidance.file = gdFile
+  settings.handoff.enabled = bool(envOr("MNEMOSYNE_HANDOFF"), settings.handoff.enabled)
+  settings.handoff.compact = bool(envOr("MNEMOSYNE_HANDOFF_COMPACT"), settings.handoff.compact)
+  const hoInstruction = envOr("MNEMOSYNE_HANDOFF_INSTRUCTION")
+  if (hoInstruction) settings.handoff.instruction = hoInstruction
   settings.mcpHealth.enabled = bool(process.env.MNEMOSYNE_MCP_HEALTH, settings.mcpHealth.enabled)
   settings.mcpHealth.intervalMs = num(process.env.MNEMOSYNE_MCP_HEALTH_INTERVAL_MS, settings.mcpHealth.intervalMs)
   settings.mcpHealth.initialDelayMs = num(process.env.MNEMOSYNE_MCP_HEALTH_INITIAL_MS, settings.mcpHealth.initialDelayMs)
@@ -713,7 +743,21 @@ Use the tools directly for what the auto path should not decide:
 - "Forget X": recall to find the id, then forget(memory_id) (hard delete) or invalidate(memory_id) (keep history). Reply "Removed."
 - Maintenance: stats, diagnose (health), hygiene_audit / hygiene_clean (noise), export / import. Consolidation is automatic; call sleep yourself only after a very long session (all_sessions=true; dry_run=true to preview).
 
-Do not commit computation results, tool-call traces, drafts, or code the user has not accepted. Before calling an unfamiliar Mnemosyne tool, read its exact schema — the catalog may list only a few of the 29 tools.`
+Do not commit computation results, tool-call traces, drafts, or code the user has not accepted. Before calling an unfamiliar Mnemosyne tool, read its exact schema — the catalog may list only a few of the 29 tools.
+
+The /handoff command submits one turn asking you to distil this session into Mnemosyne and leave a handoff note, then compacts; treat that turn as the priority and follow it exactly.`
+
+/**
+ * Built-in `/handoff` instruction, submitted as a user turn by the command.
+ * The first line is the ritual the user sees; the rest tells the model what
+ * must survive the compaction that immediately follows.
+ */
+const DEFAULT_HANDOFF_INSTRUCTION = `Distill your learnings to Mnemosyne and prepare enough handoff context for me to compact.
+
+Put everything that must survive the loss of this transcript into these two forms:
+
+1. Mnemosyne. Store the durable facts this session established and that are not already stored: decisions, corrections, user preferences, fixes, and verified findings. Use the mnemosyne tools (one fact per call, a standalone sentence, scope 'global', a source category such as decision|fact|insight|fix|preference, and tags in metadata.tags). Do not announce tool use.
+2. A handoff note, in your reply. State the task and its current state, what is done and verified, what remains, the files or commands that matter, and any open questions or pitfalls. Keep it tight: this is a briefing for whoever continues the work, not a transcript.`
 
 /** Resolve guidance text: inline > file > built-in. */
 function loadGuidance(settings: PluginSettings): string {
@@ -735,6 +779,24 @@ function loadGuidance(settings: PluginSettings): string {
  * Plugin
  * ------------------------------------------------------------------ */
 
+/** Invocation handed to a registered command's `execute`. */
+interface CommandInvocation {
+  sessionID: string
+  /** The prompt the command was invoked with (its arguments and attachments). */
+  prompt?: Loose
+  delivery?: "steer" | "queue"
+}
+
+interface CommandDefinition {
+  name: string
+  description?: string
+  execute(input: CommandInvocation): Promise<void> | void
+}
+
+interface CommandEditor {
+  add(definition: CommandDefinition): void
+}
+
 /**
  * Minimal structural view of the plugin `setup` context used by this file.
  * (The runtime host supplies the full OpenCode v2 context; type-only import of
@@ -753,6 +815,19 @@ interface SetupContext {
     ): Promise<{ dispose(): Promise<void> }>
     get(input: { sessionID: string }): Promise<Loose>
     context(input: { sessionID: string }): Promise<unknown>
+    /**
+     * Used only by the `/handoff` command. Optional so a host build without
+     * these methods still loads every other feature.
+     */
+    prompt?(input: { sessionID: string; text?: string; delivery?: "steer" | "queue" } & Loose): Promise<unknown>
+    compact?(input: { sessionID: string; delivery?: "steer" | "queue" }): Promise<unknown>
+  }
+  /**
+   * Command registration domain. Optional: a build without it simply does not
+   * get the `/handoff` command, and every other feature keeps working.
+   */
+  command?: {
+    transform(callback: (editor: CommandEditor) => void): Promise<{ dispose(): Promise<void> }>
   }
   event: {
     subscribe(options?: { signal?: AbortSignal }): AsyncIterable<Loose>
@@ -1005,6 +1080,58 @@ export default {
           )
         : null
     mcpHealth?.start()
+
+    /* ---------------- 5. /handoff COMMAND (distil, then compact) ---------- */
+
+    // A user-invoked shorthand for the end-of-session ritual. It submits one
+    // turn that asks the model to curate its learnings into Mnemosyne and leave
+    // a handoff note, then queues a compaction so that note is folded into the
+    // summary while it is still in the transcript. The prompt is steered in
+    // immediately; the compaction is queued so it runs at the next step
+    // boundary after the handoff turn rather than pre-empting it. The existing
+    // compaction hook remains the safety net for anything the model did not
+    // store itself.
+    const command = ctx.command
+    if (settings.handoff.enabled && command && typeof command.transform === "function") {
+      const instruction = settings.handoff.instruction.trim() || DEFAULT_HANDOFF_INSTRUCTION
+      const session = ctx.session
+      const registration = await command.transform((editor) => {
+        editor.add({
+          name: "handoff",
+          description: "Distil learnings into Mnemosyne, write a handoff note, then compact",
+          execute: async (invocation) => {
+            const sessionID = typeof invocation?.sessionID === "string" ? invocation.sessionID : ""
+            if (!sessionID) {
+              warn("/handoff invoked without a sessionID; skipping")
+              return
+            }
+            const promptFn = session.prompt
+            if (typeof promptFn !== "function") {
+              warn("/handoff: this build does not expose session.prompt; skipping")
+              return
+            }
+            const extra = typeof invocation.prompt?.text === "string" ? invocation.prompt.text.trim() : ""
+            const text = extra ? `${instruction}\n\nAdditional focus for this handoff:\n${extra}` : instruction
+            const delivery = invocation.delivery === "queue" ? "queue" : "steer"
+            try {
+              await promptFn({ ...(invocation.prompt ?? {}), sessionID, text, delivery })
+            } catch (err) {
+              warn(`/handoff prompt failed: ${err instanceof Error ? err.message : err}`)
+              return
+            }
+            const compactFn = session.compact
+            if (!settings.handoff.compact || typeof compactFn !== "function") return
+            try {
+              await compactFn({ sessionID, delivery: "queue" })
+              if (settings.debug) log(`/handoff: submitted handoff turn and queued compaction for ${sessionID}`)
+            } catch (err) {
+              warn(`/handoff compaction request failed: ${err instanceof Error ? err.message : err}`)
+            }
+          },
+        })
+      })
+      disposables.push(registration)
+    }
 
     /* ---------------- cleanup ---------------- */
 
