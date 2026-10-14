@@ -32,6 +32,10 @@
  *                      its learnings into Mnemosyne and leave a handoff note,
  *                      then queues a compaction so the note is folded into the
  *                      summary while it is still present in the transcript.
+ *                      After that compaction the note is lifted out of the
+ *                      outgoing transcript and injected as a system part on the
+ *                      next turn (the breadcrumb), and stored in Mnemosyne so a
+ *                      later session can recall it.
  *
  * Configuration precedence: defaults < ~/.config/opencode/mnemosyne.json
  * < environment variables (MNEMOSYNE_*). The bearer token is resolved from
@@ -137,6 +141,15 @@ interface PluginSettings {
     instruction: string
     /** Also request compaction once the handoff turn has been submitted. */
     compact: boolean
+    /**
+     * After a handoff-triggered compaction, inject the handoff note the model
+     * wrote as a system part on the next turn, so the model resumes with the
+     * recorded state and next step in view. The note is also stored in
+     * Mnemosyne (tagged handoff) so a later session can recall it.
+     */
+    breadcrumb: boolean
+    /** Character cap for the injected/stored handoff note. */
+    breadcrumbChars: number
   }
   /**
    * Keep the host's remote MCP connection alive. OpenCode v2 does not retry a
@@ -201,7 +214,7 @@ const DEFAULTS: PluginSettings = {
     force: false,
   },
   guidance: { enabled: true, file: "", text: "" },
-  handoff: { enabled: true, instruction: "", compact: true },
+  handoff: { enabled: true, instruction: "", compact: true, breadcrumb: true, breadcrumbChars: 2000 },
   // Independent of the sleep/recall/capture features: this is a reliability
   // mechanism, so it must keep working even if those are turned off.
   mcpHealth: {
@@ -380,6 +393,8 @@ function resolveSettings(): PluginSettings {
     if (typeof ho.enabled === "boolean") settings.handoff.enabled = ho.enabled
     if (typeof ho.instruction === "string") settings.handoff.instruction = ho.instruction
     if (typeof ho.compact === "boolean") settings.handoff.compact = ho.compact
+    if (typeof ho.breadcrumb === "boolean") settings.handoff.breadcrumb = ho.breadcrumb
+    if (typeof ho.breadcrumbChars === "number") settings.handoff.breadcrumbChars = ho.breadcrumbChars
   }
   const mh = asObj(cfg?.mcpHealth)
   if (mh) {
@@ -425,6 +440,11 @@ function resolveSettings(): PluginSettings {
   if (gdFile) settings.guidance.file = gdFile
   settings.handoff.enabled = bool(envOr("MNEMOSYNE_HANDOFF"), settings.handoff.enabled)
   settings.handoff.compact = bool(envOr("MNEMOSYNE_HANDOFF_COMPACT"), settings.handoff.compact)
+  settings.handoff.breadcrumb = bool(envOr("MNEMOSYNE_HANDOFF_BREADCRUMB"), settings.handoff.breadcrumb)
+  settings.handoff.breadcrumbChars = num(
+    process.env.MNEMOSYNE_HANDOFF_BREADCRUMB_CHARS,
+    settings.handoff.breadcrumbChars,
+  )
   const hoInstruction = envOr("MNEMOSYNE_HANDOFF_INSTRUCTION")
   if (hoInstruction) settings.handoff.instruction = hoInstruction
   settings.mcpHealth.enabled = bool(process.env.MNEMOSYNE_MCP_HEALTH, settings.mcpHealth.enabled)
@@ -707,6 +727,31 @@ function lastUserMessage(messages: Loose[]): { id: string; text: string } | null
   return null
 }
 
+/**
+ * Assistant text written after the last user turn. On the compaction that
+ * follows `/handoff` this is the handoff note; on any other transcript it is
+ * just the most recent reply.
+ */
+function lastTurnAssistantText(messages: Loose[]): string {
+  let start = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m && roleOf(m) === "user") {
+      start = i
+      break
+    }
+  }
+  if (start === -1) return ""
+  const parts: string[] = []
+  for (let i = start + 1; i < messages.length; i++) {
+    const m = messages[i]
+    if (!m || roleOf(m) !== "assistant") continue
+    const text = messageText(m)
+    if (text.trim()) parts.push(text.trim())
+  }
+  return parts.join("\n\n")
+}
+
 function hash(input: string): string {
   let h = 2166136261
   for (let i = 0; i < input.length; i++) {
@@ -745,7 +790,7 @@ Use the tools directly for what the auto path should not decide:
 
 Do not commit computation results, tool-call traces, drafts, or code the user has not accepted. Before calling an unfamiliar Mnemosyne tool, read its exact schema — the catalog may list only a few of the 29 tools.
 
-The /handoff command submits one turn asking you to distil this session into Mnemosyne and leave a handoff note, then compacts; treat that turn as the priority and follow it exactly.`
+The /handoff command submits one turn asking you to distil this session into Mnemosyne and leave a handoff note, then compacts; its note is recalled automatically after compaction. Treat that turn as the priority and follow it exactly.`
 
 /**
  * Built-in `/handoff` instruction, submitted as a user turn by the command.
@@ -757,7 +802,7 @@ const DEFAULT_HANDOFF_INSTRUCTION = `Distill your learnings to Mnemosyne and pre
 Put everything that must survive the loss of this transcript into these two forms:
 
 1. Mnemosyne. Store the durable facts this session established and that are not already stored: decisions, corrections, user preferences, fixes, and verified findings. Use the mnemosyne tools (one fact per call, a standalone sentence, scope 'global', a source category such as decision|fact|insight|fix|preference, and tags in metadata.tags). Do not announce tool use.
-2. A handoff note, in your reply. State the task and its current state, what is done and verified, what remains, the files or commands that matter, and any open questions or pitfalls. Keep it tight: this is a briefing for whoever continues the work, not a transcript.`
+2. A handoff note, in your reply. State the task and its current state, what is done and verified, what remains, the files or commands that matter, and any open questions or pitfalls. Keep it tight: this is a briefing for whoever continues the work, not a transcript. It is recalled automatically after the compaction, so write it to stand on its own.`
 
 /** Resolve guidance text: inline > file > built-in. */
 function loadGuidance(settings: PluginSettings): string {
@@ -1081,7 +1126,41 @@ export default {
         : null
     mcpHealth?.start()
 
-    /* ---------------- 5. /handoff COMMAND (distil, then compact) ---------- */
+    /* ---------------- 5. /handoff BREADCRUMB (recall after compaction) --- */
+
+    // A /handoff compaction replaces the transcript that holds the handoff note
+    // with a summary. To keep the note (and its next step) in view, the command
+    // marks the session handoff-pending, the `compaction` hook lifts the note
+    // out of the outgoing transcript, and the next `context` hook injects it as
+    // a system part. Independent of capture/recall so it works with either off.
+    const handoffBreadcrumb =
+      settings.handoff.enabled && settings.handoff.breadcrumb
+        ? new HandoffBreadcrumb(ctx as unknown as CtxLike, client, settings, warn)
+        : null
+    if (handoffBreadcrumb) {
+      const breadcrumb = handoffBreadcrumb
+      const compactionReg = await ctx.session.hook("compaction", async (event) => {
+        try {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : ""
+          if (!sessionID) return
+          const messages = Array.isArray(event?.messages) ? (event.messages as Loose[]) : []
+          await breadcrumb.captureFromCompaction(sessionID, messages)
+        } catch (err) {
+          warn(`handoff breadcrumb (compaction) error: ${err instanceof Error ? err.message : err}`)
+        }
+      })
+      disposables.push(compactionReg)
+      const breadcrumbReg = await ctx.session.hook("context", async (event) => {
+        try {
+          await breadcrumb.inject(event as Loose)
+        } catch (err) {
+          if (settings.debug) warn(`handoff breadcrumb (context) error: ${err instanceof Error ? err.message : err}`)
+        }
+      })
+      disposables.push(breadcrumbReg)
+    }
+
+    /* ---------------- 6. /handoff COMMAND (distil, then compact) ---------- */
 
     // A user-invoked shorthand for the end-of-session ritual. It submits one
     // turn that asks the model to curate its learnings into Mnemosyne and leave
@@ -1110,6 +1189,10 @@ export default {
               warn("/handoff: this build does not expose session.prompt; skipping")
               return
             }
+            // Mark the session so the compaction that follows records the note
+            // for the post-compaction breadcrumb, even if we do not request the
+            // compaction ourselves.
+            if (handoffBreadcrumb) await handoffBreadcrumb.markPending(sessionID)
             const extra = typeof invocation.prompt?.text === "string" ? invocation.prompt.text.trim() : ""
             const text = extra ? `${instruction}\n\nAdditional focus for this handoff:\n${extra}` : instruction
             const delivery = invocation.delivery === "queue" ? "queue" : "steer"
@@ -1458,6 +1541,151 @@ class CaptureRunner {
       veracity: "inferred", // LLM-extracted from the transcript, not a direct quote
       metadata: { tags: [...new Set(tags)] },
     })
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * /handoff breadcrumb (recall the handoff note after compaction)
+ * ------------------------------------------------------------------ */
+
+const handoffPendingKey = (sessionID: string) => `opencode-mnemosyne/handoff-pending/${sessionID}`
+const handoffNoteKey = (sessionID: string) => `opencode-mnemosyne/handoff-note/${sessionID}`
+/** A pending marker older than this is stale (the handoff never compacted). */
+const HANDOFF_PENDING_TTL_MS = 15 * 60_000
+
+/**
+ * Post-compaction breadcrumb for `/handoff`. The command marks the session
+ * handoff-pending. When the compaction then runs, the hook lifts the model's
+ * handoff turn out of the transcript that is about to be replaced, stashes it,
+ * and stores it in Mnemosyne. The next `context` hook after compaction injects
+ * the stashed note as a system part, so the model resumes with the recorded
+ * state and next step in view even though the messages that held it are gone.
+ */
+class HandoffBreadcrumb {
+  /** `${sessionID}:${userMessageID}` pairs that already received the breadcrumb. */
+  private readonly injected = new Set<string>()
+  /**
+   * Sessions already checked for a stashed note since the last stash. Without
+   * this, every tool continuation in a turn would read storage again. A stash
+   * clears the entry so the next call after compaction looks again.
+   */
+  private readonly checked = new Set<string>()
+
+  constructor(
+    private readonly ctx: CtxLike,
+    private readonly client: MnemosyneClient,
+    private readonly settings: PluginSettings,
+    private readonly warn: (...args: unknown[]) => void,
+  ) {}
+
+  /** Mark a session so the next compaction records its handoff note. */
+  async markPending(sessionID: string): Promise<void> {
+    this.checked.delete(sessionID)
+    try {
+      await this.ctx.storage.set(handoffPendingKey(sessionID), { at: Date.now() })
+    } catch (err) {
+      this.warn(`handoff: could not mark ${sessionID} pending: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  /**
+   * Compaction hook entry point: when the session is handoff-pending and fresh,
+   * lift the handoff note from the transcript, stash it for injection, and
+   * persist it to Mnemosyne. Never throws.
+   */
+  async captureFromCompaction(sessionID: string, messages: Loose[]): Promise<void> {
+    if (!this.settings.handoff.breadcrumb) return
+    let pending: { at?: number } | undefined
+    try {
+      pending = (await this.ctx.storage.get<{ at?: number }>(handoffPendingKey(sessionID))) ?? undefined
+    } catch {
+      return
+    }
+    if (!pending || typeof pending.at !== "number") return
+    await this.clear(handoffPendingKey(sessionID))
+    if (Date.now() - pending.at > HANDOFF_PENDING_TTL_MS) return
+
+    const note = truncate(
+      lastTurnAssistantText(messages),
+      Math.max(200, this.settings.handoff.breadcrumbChars),
+    ).trim()
+    if (!note) return
+
+    try {
+      await this.ctx.storage.set(handoffNoteKey(sessionID), { text: note, at: Date.now() })
+      this.checked.delete(sessionID) // the next context call must look for the note
+    } catch (err) {
+      this.warn(`handoff: could not stash the note for ${sessionID}: ${err instanceof Error ? err.message : err}`)
+    }
+
+    // Persist it so a later session, or another machine, can recall it too.
+    try {
+      const tags = ["opencode", "handoff"]
+      const label = projectLabel(this.ctx.location?.directory)
+      if (label) tags.push(`project:${label}`)
+      await this.client.call("mnemosyne_remember", {
+        content: note,
+        importance: 0.7,
+        source: "task",
+        scope: "global",
+        veracity: "inferred",
+        metadata: { tags },
+      })
+    } catch (err) {
+      this.warn(`handoff: could not store the note in Mnemosyne: ${err instanceof Error ? err.message : err}`)
+    }
+  }
+
+  /**
+   * Context hook entry point: inject the stashed handoff note once, on the first
+   * model call after compaction, then clear it. An entry is only marked injected
+   * when a note is actually pushed, so the post-compaction call is not
+   * suppressed by the handoff turn's own (pre-compaction) context calls.
+   */
+  async inject(event: Loose): Promise<void> {
+    if (!this.settings.handoff.breadcrumb) return
+    const sessionID = typeof event.sessionID === "string" ? event.sessionID : ""
+    if (!sessionID) return
+    const userMsg = lastUserMessage((event.messages ?? []) as Loose[])
+    if (!userMsg || !userMsg.text.trim()) return
+    const key = `${sessionID}:${userMsg.id}`
+    if (this.injected.has(key) || this.checked.has(sessionID)) return
+    this.checked.add(sessionID)
+    if (this.checked.size > 20_000) this.checked.clear()
+
+    let note: { text?: string } | undefined
+    try {
+      note = (await this.ctx.storage.get<{ text?: string }>(handoffNoteKey(sessionID))) ?? undefined
+    } catch {
+      return
+    }
+    const text = typeof note?.text === "string" ? note.text.trim() : ""
+    if (!text) return
+    if (!Array.isArray(event.system)) {
+      this.checked.delete(sessionID) // re-check on the next call rather than drop it
+      return
+    }
+
+    this.injected.add(key)
+    if (this.injected.size > 20_000) this.injected.clear()
+    await this.clear(handoffNoteKey(sessionID))
+    event.system.push({
+      type: "text",
+      text:
+        `# Handoff (recalled after compaction)\n` +
+        `This session was compacted after a /handoff. Resume from the handoff note below, including its next step. ` +
+        `The same note is stored in Mnemosyne under a 'handoff' tag if it is needed again.\n\n` +
+        text,
+    })
+  }
+
+  /** Clear a key by writing an empty object (the host has no guaranteed remove). */
+  private async clear(key: string): Promise<void> {
+    try {
+      await this.ctx.storage.set(key, {})
+    } catch {
+      // best effort: a stale note is bounded by the one-shot injection guard
+    }
   }
 }
 

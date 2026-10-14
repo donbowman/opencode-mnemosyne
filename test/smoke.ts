@@ -163,6 +163,15 @@ const MESSAGES: Loose[] = [
   { id: "m2", role: "assistant", content: [{ type: "text", text: "In src/uploader.ts, retryUpload()." }] },
 ]
 
+const HANDOFF_MESSAGES: Loose[] = [
+  { id: "h1", role: "user", content: [{ type: "text", text: "/handoff" }] },
+  {
+    id: "h2",
+    role: "assistant",
+    content: [{ type: "text", text: "Handoff: upload retry is done; next step is B; see src/uploader.ts." }],
+  },
+]
+
 async function main(): Promise<void> {
   const mock = await startMockServer()
 
@@ -239,6 +248,44 @@ async function main(): Promise<void> {
   assert.equal(app.compacts.length, 1, "/handoff requests exactly one compaction")
   assert.equal(app.compacts[0].sessionID, "s3", "the compaction targets the invoking session")
   assert.equal(app.compacts[0].delivery, "queue", "the compaction is queued so it follows the handoff turn")
+
+  /* ---------------- /handoff breadcrumb (recall after compaction) -------- */
+
+  const pending = app.storage.get("opencode-mnemosyne/handoff-pending/s3") as { at?: number } | undefined
+  assert.ok(pending?.at, "/handoff marks the session handoff-pending")
+
+  // Compaction runs: the breadcrumb hook lifts the handoff note out of the
+  // transcript that is about to be replaced.
+  for (const hook of app.hooks.compaction ?? []) {
+    await hook({ sessionID: "s3", messages: HANDOFF_MESSAGES })
+  }
+
+  const stashed = app.storage.get("opencode-mnemosyne/handoff-note/s3") as { text?: string } | undefined
+  assert.ok(stashed?.text, "the handoff note is stashed across the compaction")
+  assert.match(String(stashed!.text), /next step is B/, "the stash holds the model's handoff note")
+  const clearedPending = app.storage.get("opencode-mnemosyne/handoff-pending/s3") as { at?: number } | undefined
+  assert.equal(clearedPending?.at, undefined, "the pending marker is consumed by the compaction")
+
+  const handoffMemory = mock.calls.find((call) =>
+    (call.args?.metadata?.tags ?? []).includes("handoff"),
+  )
+  assert.ok(handoffMemory, "the handoff note is also stored in Mnemosyne")
+  assert.match(String(handoffMemory!.args.content), /next step is B/, "the stored memory carries the note")
+
+  // The first model call after compaction gets the breadcrumb.
+  const postEvent: Loose = { sessionID: "s3", messages: [{ id: "h3", role: "user", text: "continue" }], system: [] }
+  for (const contextHook of app.hooks.context ?? []) await contextHook(postEvent)
+  const injected = postEvent.system.map((part: Loose) => String(part.text ?? "")).join("\n")
+  assert.match(injected, /Handoff \(recalled after compaction\)/, "the handoff note is recalled after compaction")
+  assert.match(injected, /next step is B/, "the recalled breadcrumb carries the note")
+
+  // Injected only once: the note is consumed on injection.
+  const second: Loose = { sessionID: "s3", messages: [{ id: "h4", role: "user", text: "again" }], system: [] }
+  for (const contextHook of app.hooks.context ?? []) await contextHook(second)
+  assert.ok(
+    !second.system.map((part: Loose) => String(part.text ?? "")).join("\n").includes("recalled after compaction"),
+    "the breadcrumb is injected only once",
+  )
 
   if (!cleanup) throw new Error("plugin setup did not activate (missing URL/token?)")
   await cleanup()
