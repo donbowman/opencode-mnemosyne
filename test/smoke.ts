@@ -4,7 +4,9 @@
  * Runs the plugin against a mock OpenCode setup context and a mock Mnemosyne
  * MCP server (streamable HTTP), asserting the compaction hook distills the
  * transcript about to be summarized into Mnemosyne before compaction proceeds,
- * and that the hook stays fail-open when the server is unreachable.
+ * that an interrupted turn (a user escape/stop, or a prompt superseded by a
+ * newer one) is still captured while a shutdown interruption is not, and that
+ * the hook stays fail-open when the server is unreachable.
  *
  * Run (Node >= 23.6 strips types natively):
  *   node test/smoke.ts
@@ -19,6 +21,18 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 type Loose = Record<string, any>
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Poll until `predicate` holds; the capture path has a jittered settle delay. */
+async function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await sleep(50)
+  }
+  assert.ok(predicate(), message)
+}
 
 function startMockServer(): Promise<{ url: string; close: () => Promise<void>; calls: Loose[] }> {
   const calls: Loose[] = []
@@ -98,6 +112,23 @@ function makeCtx(messages: Loose[]) {
   const commands: Loose[] = []
   const prompts: Loose[] = []
   const compacts: Loose[] = []
+
+  // Controllable server event stream. The test pushes events the way the real
+  // broadcast would; the plugin's capture loop consumes them.
+  const pending: Loose[] = []
+  const waiters: Array<(value: Loose | undefined) => void> = []
+  let ended = false
+  const end = () => {
+    if (ended) return
+    ended = true
+    for (const waiter of waiters.splice(0)) waiter(undefined)
+  }
+  const emit = (event: Loose) => {
+    const waiter = waiters.shift()
+    if (waiter) waiter(event)
+    else pending.push(event)
+  }
+
   const context = {
     app: { version: "smoke" },
     location: { directory: "/work/proj", project: { id: "p1" } },
@@ -128,10 +159,21 @@ function makeCtx(messages: Loose[]) {
       },
     },
     event: {
-      subscribe: async function* (options?: { signal?: AbortSignal }) {
+      subscribe(options?: { signal?: AbortSignal }) {
         const signal = options?.signal
-        if (signal?.aborted) return
-        await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve()))
+        signal?.addEventListener("abort", end)
+        return (async function* () {
+          while (true) {
+            if (pending.length > 0) {
+              yield pending.shift()!
+              continue
+            }
+            if (ended) return
+            const next = await new Promise<Loose | undefined>((resolve) => waiters.push(resolve))
+            if (next === undefined) return
+            yield next
+          }
+        })()
       },
     },
     storage: {
@@ -155,7 +197,7 @@ function makeCtx(messages: Loose[]) {
       }),
     },
   }
-  return { context, hooks, storage, commands, prompts, compacts }
+  return { context, hooks, storage, commands, prompts, compacts, events: { emit, end } }
 }
 
 const MESSAGES: Loose[] = [
@@ -285,6 +327,45 @@ async function main(): Promise<void> {
   assert.ok(
     !second.system.map((part: Loose) => String(part.text ?? "")).join("\n").includes("recalled after compaction"),
     "the breadcrumb is injected only once",
+  )
+
+  /* ---------------- interrupted turns are captured ---------------- */
+
+  // A user interrupt (escape/stop) ends a turn with no `succeeded` event, so
+  // the plugin must treat `session.execution.interrupted` as a capture trigger.
+  const remembersBeforeInterrupt = mock.calls.filter((call) => call.name === "mnemosyne_remember").length
+  app.events.emit({ type: "session.execution.interrupted", data: { sessionID: "s4", reason: "user" } })
+  await waitFor(
+    () => app.storage.get("opencode-mnemosyne/cursor/s4") === "m2",
+    8_000,
+    "a user-interrupted turn is captured",
+  )
+  assert.ok(
+    mock.calls.filter((call) => call.name === "mnemosyne_remember").length > remembersBeforeInterrupt,
+    "the interrupted turn is distilled into Mnemosyne",
+  )
+  assert.equal(
+    app.storage.get("opencode-mnemosyne/cursor/s4"),
+    "m2",
+    "the interrupted capture advances the cursor past the captured exchange",
+  )
+
+  // A steer-superseded turn ends the same way and must be captured too.
+  app.events.emit({ type: "session.execution.interrupted", data: { sessionID: "s6", reason: "superseded" } })
+  await waitFor(
+    () => app.storage.get("opencode-mnemosyne/cursor/s6") === "m2",
+    8_000,
+    "a superseded turn is captured",
+  )
+
+  // A shutdown interruption must never trigger a capture: the server (or this
+  // location) is going away, so the summarizer + store round trip cannot finish.
+  app.events.emit({ type: "session.execution.interrupted", data: { sessionID: "s5", reason: "shutdown" } })
+  await sleep(2_800) // longer than the maximum settle delay (2500 ms)
+  assert.equal(
+    app.storage.get("opencode-mnemosyne/cursor/s5"),
+    undefined,
+    "a shutdown interruption does not trigger a capture",
   )
 
   if (!cleanup) throw new Error("plugin setup did not activate (missing URL/token?)")

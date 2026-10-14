@@ -13,7 +13,7 @@ v2 the same behaviour using OpenCode's own plugin API.
 | Mechanism | OpenCode v2 API | What it does |
 |---|---|---|
 | **Auto-recall** | `ctx.session.hook("context", …)` | Before a model call with a **new** user message, runs `mnemosyne_recall` and appends the best hits as a system part. Uses a short timeout so a slow server never blocks the turn. |
-| **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). |
+| **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). An interrupted turn (`session.execution.interrupted` with reason `user` or `superseded`) is captured too, so an escape/stop or a steer-superseded turn is not lost; `shutdown` and `inactivity` interruptions are ignored. |
 | **Compaction capture** | `ctx.session.hook("compaction", …)` | Before every checkpoint summary (automatic or `/compact`), forces one bounded capture pass over the transcript that is about to be replaced, so durable facts reach Mnemosyne before those messages leave the context window. Fail-open and time-boxed. |
 | **`/handoff` command** | `ctx.command.transform` | Registers a `/handoff` command that submits one turn asking the model to distil its learnings into Mnemosyne and leave a handoff note, then queues a compaction so the note is folded into the summary while it is still in the transcript. After the compaction the note is re-injected as a system part (a breadcrumb) on the next turn and stored in Mnemosyne. |
 | **Auto-sleep** | periodic check (startup + every 15 min) | When unconsolidated working memory reaches `sleep.threshold`, runs `mnemosyne_sleep` so working memory can compress into the episodic/vector tier. |
@@ -118,6 +118,7 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "contextChars": 7000,
     "extraPrompt": "",
     "onCompaction": true,
+    "onInterrupt": true,
     "compactionExchanges": 12,
     "compactionTimeoutMs": 20000
   },
@@ -167,6 +168,7 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 | `contextChars` | Character budget handed to the summarizer for one exchange. |
 | `extraPrompt` | Extra system guidance appended to the summarizer prompt. |
 | `onCompaction` | Force a capture pass when the session is compacted (automatic or `/compact`), before older messages are replaced by the summary. Default `true`. |
+| `onInterrupt` | Also capture a turn that ends without succeeding: `session.execution.interrupted` with reason `user` (escape/stop) or `superseded` (a newer prompt replaced the running turn). Default `true`. `shutdown` and `inactivity` interruptions are always ignored. |
 | `compactionExchanges` | Max exchanges looked back on one compaction capture. Default `12`. |
 | `compactionTimeoutMs` | Total budget for one compaction capture; bounds how long compaction can be delayed. Default `20000`. |
 
@@ -302,6 +304,7 @@ plugin `console.log` is not currently surfaced in the service log file.)
 | `MNEMOSYNE_CAPTURE_MAX` | `5` | Max memories stored per exchange |
 | `MNEMOSYNE_CAPTURE_MODEL` | – | Summarizer `provider/model-id` |
 | `MNEMOSYNE_CAPTURE_ON_COMPACTION` | `true` | `0`/`false` disables the pre-compaction capture pass |
+| `MNEMOSYNE_CAPTURE_ON_INTERRUPT` | `true` | `0`/`false` disables capture of user-interrupted / superseded turns |
 | `MNEMOSYNE_CAPTURE_COMPACTION_MAX` | `12` | Max exchanges looked back on one compaction capture |
 | `MNEMOSYNE_CAPTURE_COMPACTION_TIMEOUT_MS` | `20000` | Budget for one compaction capture |
 | `MNEMOSYNE_SLEEP` | `true` | `0`/`false` disables auto-sleep |
@@ -371,6 +374,14 @@ plugin `console.log` is not currently surfaced in the service log file.)
   continuation), alongside recall. It is a fixed system part, so it costs a
   small, constant amount of context per turn; disable it with
   `guidance.enabled: false` if you keep the instructions in `AGENTS.md` instead.
+- A turn that is **interrupted** rather than completed still ends a boundary:
+  pressing escape/stop, or steering in a new prompt that supersedes the running
+  one, produces `session.execution.interrupted` with reason `user`/`superseded`,
+  and the tail of that turn is captured like any other. The two interruptions
+  that are deliberately skipped are `shutdown` (the server is terminating) and
+  `inactivity` (this location's services are being evicted); in both cases the
+  summarizer and store round trip could not complete. Set
+  `capture.onInterrupt: false` to capture only completed turns.
 - Recall runs on its own client and never queues behind capture, sleep, or
   health checks. Sleep runs on its own client and uses a longer timeout.
 
@@ -381,7 +392,9 @@ plugin `console.log` is not currently surfaced in the service log file.)
 2. **Capture**: work on something real for a turn, wait a few seconds, then
    check the store grew: `mnemosyne_stats` shows new rows with a `source` of
    `decision`/`fact`/`insight`/… and tags containing `opencode` +
-   `auto-capture`.
+   `auto-capture`. Do the same after **interrupting** a turn (press escape, or
+   steer in a new prompt mid-turn): the aborted turn should still produce a
+   memory once the settle delay passes.
 3. **Recall**: in a brand-new session, ask a question whose answer lives in an
    earlier captured memory. If the model answers using it without you
    prompting, injection is working. You can also watch a memory's

@@ -21,6 +21,7 @@
     "contextChars": 7000,
     "extraPrompt": "",
     "onCompaction": true,
+    "onInterrupt": true,
     "compactionExchanges": 12,
     "compactionTimeoutMs": 20000
   },
