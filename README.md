@@ -15,7 +15,7 @@ v2 the same behaviour using OpenCode's own plugin API.
 | **Auto-recall** | `ctx.session.hook("context", …)` | Before a model call with a **new** user message, runs `mnemosyne_recall` and appends the best hits as a system part. Uses a short timeout so a slow server never blocks the turn. |
 | **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). |
 | **Compaction capture** | `ctx.session.hook("compaction", …)` | Before every checkpoint summary (automatic or `/compact`), forces one bounded capture pass over the transcript that is about to be replaced, so durable facts reach Mnemosyne before those messages leave the context window. Fail-open and time-boxed. |
-| **`/handoff` command** | `ctx.command.transform` | Registers a `/handoff` command that submits one turn asking the model to distil its learnings into Mnemosyne and leave a handoff note, then queues a compaction so the note is folded into the summary while it is still in the transcript. |
+| **`/handoff` command** | `ctx.command.transform` | Registers a `/handoff` command that submits one turn asking the model to distil its learnings into Mnemosyne and leave a handoff note, then queues a compaction so the note is folded into the summary while it is still in the transcript. After the compaction the note is re-injected as a system part (a breadcrumb) on the next turn and stored in Mnemosyne. |
 | **Auto-sleep** | periodic check (startup + every 15 min) | When unconsolidated working memory reaches `sleep.threshold`, runs `mnemosyne_sleep` so working memory can compress into the episodic/vector tier. |
 | **Guidance** | `ctx.session.hook("context")` | Injects a built-in Mnemosyne tool-usage guide as a system part, so the plugin carries its own instructions and no manual `AGENTS.md` section is needed. |
 | **MCP health** | `ctx.mcp.list` + local service API | Watches the MCP server's status and asks the host to reconnect it if it enters `failed` (OpenCode v2 does not retry a failed MCP connect on its own). |
@@ -129,7 +129,7 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "force": false
   },
   "guidance": { "enabled": true, "file": "", "text": "" },
-  "handoff": { "enabled": true, "instruction": "", "compact": true },
+  "handoff": { "enabled": true, "instruction": "", "compact": true, "breadcrumb": true, "breadcrumbChars": 2000 },
   "mcpHealth": {
     "enabled": true,
     "server": "mnemosyne",
@@ -237,12 +237,39 @@ remains, the files that matter, open questions). Any text you type after
 | `enabled` | Register the command. Set `false` to leave `/handoff` undefined. |
 | `instruction` | Inline text that replaces the built-in instruction (empty uses the default). |
 | `compact` | Also request compaction once the handoff turn has been submitted. Default `true`; set `false` if you would rather run `/compact` yourself. |
+| `breadcrumb` | After a handoff compaction, re-inject the handoff note as a system part on the next turn and store it in Mnemosyne. Default `true`. |
+| `breadcrumbChars` | Character cap for the injected and stored note. Default `2000`. |
 
 > **Ordering.** The handoff prompt is submitted with `delivery: "steer"` so it
 > runs immediately, and the compaction is requested with `delivery: "queue"` so
 > it runs at the next step boundary after the handoff turn, not before it. If
 > `handoff.compact` is `false` the command only submits the instruction, and the
 > session is left for you to compact.
+
+#### The post-compaction breadcrumb
+
+The compaction replaces the transcript that holds the handoff note with a
+summary. If the summary drops the note (or its "next step"), the model resumes
+without it. To prevent that, `handoff.breadcrumb` (default on) adds a small
+around-the-compaction ritual:
+
+1. `/handoff` marks the session handoff-pending in plugin storage before it
+   submits the turn.
+2. The plugin's `compaction` hook sees the marker, lifts the assistant text
+   written after the last user message (the handoff note) out of the transcript
+   that is about to be replaced, caps it at `breadcrumbChars`, stashes it, and
+   stores it in Mnemosyne (`source: "task"`, tags `opencode` + `handoff` +
+   `project:<dir>`, `scope: "global"`).
+3. The first model call after compaction gets the stashed note back as a
+   `# Handoff (recalled after compaction)` system part, once. The note is then
+   cleared, so it is not repeated for the rest of the session.
+
+The breadcrumb is independent of the capture and recall features, and it is
+deterministic: it does not depend on the model calling a tool, or on a semantic
+recall matching. Because the note is also in Mnemosyne, a later session (or a
+different machine) can still surface it through normal auto-recall. A pending
+marker not consumed by a compaction within 15 minutes is ignored, so a stale
+`/handoff` cannot attach the wrong turn to an unrelated compaction.
 
 ### `mcpHealth`
 
@@ -285,6 +312,8 @@ plugin `console.log` is not currently surfaced in the service log file.)
 | `MNEMOSYNE_HANDOFF` | `true` | `0`/`false` does not register the `/handoff` command |
 | `MNEMOSYNE_HANDOFF_INSTRUCTION` | – | Inline text replacing the built-in `/handoff` instruction |
 | `MNEMOSYNE_HANDOFF_COMPACT` | `true` | `0`/`false` makes `/handoff` submit the turn without requesting compaction |
+| `MNEMOSYNE_HANDOFF_BREADCRUMB` | `true` | `0`/`false` disables the post-compaction breadcrumb (no injection, no Mnemosyne store) |
+| `MNEMOSYNE_HANDOFF_BREADCRUMB_CHARS` | `2000` | Character cap for the injected/stored handoff note |
 | `MNEMOSYNE_MCP_HEALTH` | `true` | `0`/`false` disables MCP health checks |
 | `MNEMOSYNE_MCP_SERVER` | `mnemosyne` | MCP server entry name |
 | `MNEMOSYNE_MCP_HEALTH_INTERVAL_MS` | `90000` | Healthy poll interval |
@@ -319,6 +348,13 @@ plugin `console.log` is not currently surfaced in the service log file.)
   the handoff note the model writes is part of the transcript the summary is
   built from. The command is registered per location and is skipped when
   `handoff.enabled` is `false` or the host build exposes no command domain.
+- **The `/handoff` breadcrumb** marks the session handoff-pending, then the
+  `compaction` hook lifts the handoff note out of the outgoing transcript and
+  the next `context` hook re-injects it as a system part once (and stores it in
+  Mnemosyne). It is deterministic and independent of capture and recall; it is
+  skipped when `handoff.breadcrumb` is `false`. Stashed notes live in plugin
+  storage under `opencode-mnemosyne/handoff-note/<sessionID>` and are cleared on
+  injection.
 - The plugin is loaded once **per project location**, and every instance sees
   the same broadcast events. Capture checks the session's `projectID` against
   the instance's own project and uses a jittered settle delay plus a stored
@@ -355,8 +391,10 @@ plugin `console.log` is not currently surfaced in the service log file.)
    uncaptured, the pass is a no-op.
 5. **`/handoff`**: run `/handoff` near the end of a session. Your turn becomes
    the handoff instruction, the model stores a few memories and writes a handoff
-   note, and the session compacts. `mnemosyne_stats` should show the new rows,
-   and the compaction summary should carry the handoff note.
+   note, and the session compacts. `mnemosyne_stats` should show the new rows.
+   Send one more message: the reply is answered with a
+   `# Handoff (recalled after compaction)` system part carrying the note, and a
+   memory tagged `handoff` should be in the store.
 6. **Sleep**: `mnemosyne_stats` should show `beam.episodic_memory.total > 0`
    once consolidation has run. If it never grows while
    `working_memory.unconsolidated` is high, see the auto-sleep note above.
@@ -399,7 +437,9 @@ npm test            # typecheck + smoke
 mock Mnemosyne MCP server. It covers the pre-compaction capture path (memories
 stored, tagged `pre-compaction`, cursor advanced, repeat runs are no-ops), the
 `/handoff` command (registered, submits the instruction turn, queues the
-compaction, and stays unregistered when `MNEMOSYNE_HANDOFF=0`), and
+compaction, and stays unregistered when `MNEMOSYNE_HANDOFF=0`), the
+post-compaction breadcrumb (the note is lifted from the outgoing transcript,
+stashed, stored in Mnemosyne, injected once on the next turn, then cleared), and
 keeps the hook fail-open when the endpoint is unreachable. The
 `--experimental-transform-types` flag is needed because the plugin uses
 TypeScript parameter properties, which Node's default type stripping does not
