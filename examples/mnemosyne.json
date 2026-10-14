@@ -32,6 +32,7 @@
     "force": false
   },
   "guidance": { "enabled": true, "file": "", "text": "" },
+  "handoff": { "enabled": true, "instruction": "", "compact": true },
   "mcpHealth": {
     "enabled": true,
     "server": "mnemosyne",

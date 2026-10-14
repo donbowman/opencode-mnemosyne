@@ -95,6 +95,9 @@ function startMockServer(): Promise<{ url: string; close: () => Promise<void>; c
 function makeCtx(messages: Loose[]) {
   const hooks: Record<string, Array<(event: Loose) => unknown>> = {}
   const storage = new Map<string, unknown>()
+  const commands: Loose[] = []
+  const prompts: Loose[] = []
+  const compacts: Loose[] = []
   const context = {
     app: { version: "smoke" },
     location: { directory: "/work/proj", project: { id: "p1" } },
@@ -105,6 +108,24 @@ function makeCtx(messages: Loose[]) {
       },
       get: async () => ({ projectID: "p1", model: { providerID: "mock", id: "mock-model" } }),
       context: async () => messages,
+      prompt: async (input: Loose) => {
+        prompts.push(input)
+        return { id: "inbox-user" }
+      },
+      compact: async (input: Loose) => {
+        compacts.push(input)
+        return { id: "inbox-compaction" }
+      },
+    },
+    command: {
+      transform: async (callback: (editor: Loose) => void) => {
+        callback({
+          add: (definition: Loose) => {
+            commands.push(definition)
+          },
+        })
+        return { dispose: async () => {} }
+      },
     },
     event: {
       subscribe: async function* (options?: { signal?: AbortSignal }) {
@@ -134,7 +155,7 @@ function makeCtx(messages: Loose[]) {
       }),
     },
   }
-  return { context, hooks, storage }
+  return { context, hooks, storage, commands, prompts, compacts }
 }
 
 const MESSAGES: Loose[] = [
@@ -199,6 +220,26 @@ async function main(): Promise<void> {
     "the same transcript is not captured twice",
   )
 
+  /* ---------------- /handoff command ---------------- */
+
+  const handoff = app.commands.find((entry) => entry.name === "handoff")
+  assert.ok(handoff, "/handoff command is registered")
+  await handoff!.execute({ sessionID: "s3", prompt: { text: "focus on the auth change" }, delivery: "steer" })
+
+  assert.equal(app.prompts.length, 1, "/handoff submits one prompt turn")
+  assert.equal(app.prompts[0].sessionID, "s3", "the handoff prompt targets the invoking session")
+  assert.equal(app.prompts[0].delivery, "steer", "the handoff prompt is steered in")
+  assert.match(
+    String(app.prompts[0].text),
+    /distill your learnings to mnemosyne/i,
+    "the prompt carries the handoff instruction",
+  )
+  assert.match(String(app.prompts[0].text), /focus on the auth change/, "trailing arguments become focus text")
+
+  assert.equal(app.compacts.length, 1, "/handoff requests exactly one compaction")
+  assert.equal(app.compacts[0].sessionID, "s3", "the compaction targets the invoking session")
+  assert.equal(app.compacts[0].delivery, "queue", "the compaction is queued so it follows the handoff turn")
+
   if (!cleanup) throw new Error("plugin setup did not activate (missing URL/token?)")
   await cleanup()
 
@@ -213,6 +254,19 @@ async function main(): Promise<void> {
   // Must resolve (never throw): a memory failure cannot block compaction.
   await deadHook!({ sessionID: "s2", messages: MESSAGES })
   await deadCleanup()
+
+  /* ---------------- /handoff disabled by config ---------------- */
+
+  process.env.MNEMOSYNE_HANDOFF = "0"
+  const off = makeCtx(MESSAGES)
+  const offCleanup = await plugin.setup(off.context as any)
+  assert.equal(
+    off.commands.find((entry) => entry.name === "handoff"),
+    undefined,
+    "MNEMOSYNE_HANDOFF=0 leaves the command unregistered",
+  )
+  if (offCleanup) await offCleanup()
+  delete process.env.MNEMOSYNE_HANDOFF
 
   await mock.close()
   console.log("smoke: OK")
