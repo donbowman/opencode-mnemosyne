@@ -14,6 +14,7 @@ v2 the same behaviour using OpenCode's own plugin API.
 |---|---|---|
 | **Auto-recall** | `ctx.session.hook("context", …)` | Before a model call with a **new** user message, runs `mnemosyne_recall` and appends the best hits as a system part. Uses a short timeout so a slow server never blocks the turn. |
 | **Auto-capture** | `ctx.event.subscribe` → `session.execution.succeeded` | When a user turn finishes, summarises the exchange with an LLM and stores the extracted durable facts via `mnemosyne_remember` (`scope=global`). An interrupted turn (`session.execution.interrupted` with reason `user` or `superseded`) is captured too, so an escape/stop or a steer-superseded turn is not lost; `shutdown` and `inactivity` interruptions are ignored. |
+| **Idle capture** | periodic per-session check | When a session has had no events for `capture.idleMs` (default 10 min) and no turn is running, runs one extra capture pass over its uncaptured tail. This records an exchange stranded by a skipped/failed capture or a turn that never succeeded, before the session is closed and its location evicted. |
 | **Compaction capture** | `ctx.session.hook("compaction", …)` | Before every checkpoint summary (automatic or `/compact`), forces one bounded capture pass over the transcript that is about to be replaced, so durable facts reach Mnemosyne before those messages leave the context window. Fail-open and time-boxed. |
 | **`/handoff` command** | `ctx.command.transform` | Registers a `/handoff` command that submits one turn asking the model to distil its learnings into Mnemosyne and leave a handoff note, then queues a compaction so the note is folded into the summary while it is still in the transcript. After the compaction the note is re-injected as a system part (a breadcrumb) on the next turn and stored in Mnemosyne. |
 | **Auto-sleep** | periodic check (startup + every 15 min) | When unconsolidated working memory reaches `sleep.threshold`, runs `mnemosyne_sleep` so working memory can compress into the episodic/vector tier. |
@@ -120,7 +121,9 @@ Defaults `< ~/.config/opencode/mnemosyne.json < environment variables`.
     "onCompaction": true,
     "onInterrupt": true,
     "compactionExchanges": 12,
-    "compactionTimeoutMs": 20000
+    "compactionTimeoutMs": 20000,
+    "idleMs": 600000,
+    "idleExchanges": 12
   },
   "sleep": {
     "enabled": true,
@@ -171,6 +174,8 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 | `onInterrupt` | Also capture a turn that ends without succeeding: `session.execution.interrupted` with reason `user` (escape/stop) or `superseded` (a newer prompt replaced the running turn). Default `true`. `shutdown` and `inactivity` interruptions are always ignored. |
 | `compactionExchanges` | Max exchanges looked back on one compaction capture. Default `12`. |
 | `compactionTimeoutMs` | Total budget for one compaction capture; bounds how long compaction can be delayed. Default `20000`. |
+| `idleMs` | Run one safety-net capture pass after a session has had no events for this long and no turn is running. Default `600000` (10 minutes). Set `0` to disable. |
+| `idleExchanges` | Max exchanges examined by one idle safety-net pass. Default `12`. |
 
 > **Compaction capture is the safety net for the context window.** OpenCode's
 > per-turn capture normally keeps up, but anything not captured before older
@@ -182,6 +187,18 @@ Set `MNEMOSYNE_CONFIG` to use a different config file path.
 > Mnemosyne is unreachable or the budget is exceeded, the normal compaction
 > cycle still runs. Note that compaction waits for this pass, so keep
 > `compactionTimeoutMs` modest on slow connections.
+
+> **Idle capture covers the session you walk away from.** Per-turn capture only
+> runs when OpenCode publishes a turn boundary, and it can skip an exchange (the
+> `minGapMs` throttle, a capture already in flight) or fail transiently. A user
+> who then leaves the session idle and closes it would lose the uncaptured tail
+> once OpenCode evicts the location's services (its own inactivity window is
+> about an hour). With `idleMs` set, a watcher tracks every session event and,
+> once the session has been quiet for that long with no turn running, runs one
+> extra capture pass over the uncaptured tail. The pass is cheap when there is
+> nothing new: the cursor check returns before calling the summarizer or
+> Mnemosyne. A `shutdown` or `inactivity` interruption disarms the watcher for
+> that session, because the location is already going away.
 
 ### `sleep`
 
@@ -307,6 +324,8 @@ plugin `console.log` is not currently surfaced in the service log file.)
 | `MNEMOSYNE_CAPTURE_ON_INTERRUPT` | `true` | `0`/`false` disables capture of user-interrupted / superseded turns |
 | `MNEMOSYNE_CAPTURE_COMPACTION_MAX` | `12` | Max exchanges looked back on one compaction capture |
 | `MNEMOSYNE_CAPTURE_COMPACTION_TIMEOUT_MS` | `20000` | Budget for one compaction capture |
+| `MNEMOSYNE_CAPTURE_IDLE_MS` | `600000` | Quiet period before the idle safety-net pass; `0` disables it |
+| `MNEMOSYNE_CAPTURE_IDLE_EXCHANGES` | `12` | Max exchanges examined by one idle safety-net pass |
 | `MNEMOSYNE_SLEEP` | `true` | `0`/`false` disables auto-sleep |
 | `MNEMOSYNE_SLEEP_THRESHOLD` | `30` | Unconsolidated working-memory threshold |
 | `MNEMOSYNE_SLEEP_ALL_SESSIONS` | `true` | Pass `all_sessions` to `mnemosyne_sleep` |
@@ -346,6 +365,17 @@ plugin `console.log` is not currently surfaced in the service log file.)
   `capture.compactionTimeoutMs`, and tags its memories `pre-compaction`. The
   hook never throws and never sets a compaction result: OpenCode's own summary
   is generated as usual afterwards.
+- **Idle capture** is a safety net for a session that goes quiet. The plugin
+  tracks the last event and the running state of every session; after
+  `capture.idleMs` with no events and no running turn it runs one capture pass
+  over the uncaptured tail, bounded by `capture.idleExchanges`. It bypasses
+  `minGapMs` and does nothing when the cursor is already at the end of the
+  transcript. If the cursor message has fallen out of the transcript (for
+  example after a compaction), the pass falls back to the normal
+  `capture.exchanges` window instead of `idleExchanges`, so it does not
+  re-capture the tail compaction just stored. It is not a backfill for a
+  session whose transcript has already fallen out of the context window;
+  compaction capture and per-turn capture cover that.
 - **`/handoff`** submits one prompt turn with the built-in instruction
   (`delivery: "steer"`) and then queues a compaction (`delivery: "queue"`), so
   the handoff note the model writes is part of the transcript the summary is
@@ -402,7 +432,13 @@ plugin `console.log` is not currently surfaced in the service log file.)
 4. **Compaction**: run `/compact` (or wait for automatic compaction) and check
    that the store grew by memories tagged `pre-compaction`. If nothing was
    uncaptured, the pass is a no-op.
-5. **`/handoff`**: run `/handoff` near the end of a session. Your turn becomes
+5. **Idle safety net**: lower `capture.idleMs` (e.g. `5000`) in
+   `mnemosyne.json`, touch `index.ts` to reload, then finish a turn and leave the
+   session alone. After the quiet period the log should show
+   `idle capture: <session> quiet for Ns`; an exchange that per-turn capture had
+   skipped appears in the store with `auto-capture` tags. Restore `idleMs` when
+   done.
+6. **`/handoff`**: run `/handoff` near the end of a session. Your turn becomes
    the handoff instruction, the model stores a few memories and writes a handoff
    note, and the session compacts. `mnemosyne_stats` should show the new rows.
    Send one more message: the reply is answered with a

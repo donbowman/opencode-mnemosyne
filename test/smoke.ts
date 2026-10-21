@@ -214,6 +214,12 @@ const HANDOFF_MESSAGES: Loose[] = [
   },
 ]
 
+/** Five exchanges, used to prove the idle first-run window fallback. */
+const BIG_MESSAGES: Loose[] = Array.from({ length: 5 }, (_, i) => [
+  { id: `u${i + 1}`, role: "user", content: [{ type: "text", text: `question ${i + 1}` }] },
+  { id: `a${i + 1}`, role: "assistant", content: [{ type: "text", text: `answer ${i + 1}` }] },
+]).flat()
+
 async function main(): Promise<void> {
   const mock = await startMockServer()
 
@@ -230,6 +236,7 @@ async function main(): Promise<void> {
       log: { recall: false, capture: false, sleep: false },
       recall: { enabled: false },
       sleep: { enabled: false },
+      capture: { idleMs: 400, idleExchanges: 4 },
       mcpHealth: { enabled: false },
     }),
   )
@@ -368,8 +375,77 @@ async function main(): Promise<void> {
     "a shutdown interruption does not trigger a capture",
   )
 
+  /* ---------------- idle safety net ---------------- */
+
+  // A session can stop producing usable turn events (a missed event, a failed
+  // turn). Once it has been quiet for `capture.idleMs` the safety-net pass must
+  // capture the uncaptured tail without another turn.
+  const beforeIdle = mock.calls.filter((call) => call.name === "mnemosyne_remember").length
+  app.events.emit({ type: "session.step.ended", data: { sessionID: "s7" } })
+  await waitFor(
+    () => app.storage.get("opencode-mnemosyne/cursor/s7") === "m2",
+    10_000,
+    "an idle session is captured by the safety net",
+  )
+  assert.ok(
+    mock.calls.filter((call) => call.name === "mnemosyne_remember").length > beforeIdle,
+    "the idle safety net distils the stranded exchange into Mnemosyne",
+  )
+
+  // A turn that is still running is not flushed mid-stream.
+  app.events.emit({ type: "session.execution.started", data: { sessionID: "s8" } })
+  await sleep(2_500) // longer than idleMs plus the capture settle delay
+  assert.equal(
+    app.storage.get("opencode-mnemosyne/cursor/s8"),
+    undefined,
+    "the idle safety net skips a session with a running turn",
+  )
+  app.events.emit({ type: "session.execution.succeeded", data: { sessionID: "s8" } })
+  await waitFor(
+    () => app.storage.get("opencode-mnemosyne/cursor/s8") === "m2",
+    8_000,
+    "a completed turn is still captured normally",
+  )
+
+  // An idle pass over an already-captured session must not call the summarizer
+  // or store a duplicate: the cursor check returns first.
+  app.storage.set("opencode-mnemosyne/cursor/s9", "m2")
+  const beforeNoop = mock.calls.filter((call) => call.name === "mnemosyne_remember").length
+  app.events.emit({ type: "session.step.ended", data: { sessionID: "s9" } })
+  await sleep(3_500) // idleMs + maximum settle delay + slack
+  assert.equal(
+    mock.calls.filter((call) => call.name === "mnemosyne_remember").length,
+    beforeNoop,
+    "the idle safety net does not re-capture an already-captured session",
+  )
+
   if (!cleanup) throw new Error("plugin setup did not activate (missing URL/token?)")
   await cleanup()
+
+  /* ---------------- idle first-run window is bounded ---------------- */
+
+  // When the cursor message is gone (as after a compaction), the idle pass must
+  // fall back to the normal `capture.exchanges` window rather than look back
+  // `idleExchanges`, so it does not re-capture the tail compaction just stored.
+  process.env.MNEMOSYNE_CAPTURE_IDLE_MS = "300"
+  const big = makeCtx(BIG_MESSAGES)
+  const bigCleanup = await plugin.setup(big.context as any)
+  if (!bigCleanup) throw new Error("plugin setup did not activate for the bounded-window instance")
+  big.storage.set("opencode-mnemosyne/cursor/s10", "a-message-that-is-no-longer-in-context")
+  const beforeBounded = mock.calls.filter((call) => call.name === "mnemosyne_remember").length
+  big.events.emit({ type: "session.step.ended", data: { sessionID: "s10" } })
+  await waitFor(
+    () => big.storage.get("opencode-mnemosyne/cursor/s10") === "a5",
+    10_000,
+    "the idle pass captures from a stale cursor",
+  )
+  assert.equal(
+    mock.calls.filter((call) => call.name === "mnemosyne_remember").length - beforeBounded,
+    2,
+    "a stale cursor limits the idle pass to the normal capture.exchanges window",
+  )
+  await bigCleanup()
+  delete process.env.MNEMOSYNE_CAPTURE_IDLE_MS
 
   /* ---------------- fail-open when the server is unreachable ---------------- */
 
