@@ -23,7 +23,9 @@
     "onCompaction": true,
     "onInterrupt": true,
     "compactionExchanges": 12,
-    "compactionTimeoutMs": 20000
+    "compactionTimeoutMs": 20000,
+    "idleMs": 600000,
+    "idleExchanges": 12
   },
   "sleep": {
     "enabled": true,

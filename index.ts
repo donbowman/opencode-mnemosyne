@@ -40,6 +40,11 @@
  *                      next turn (the breadcrumb), and stored in Mnemosyne so a
  *                      later session can recall it.
  *
+ *   5. IDLE CAPTURE  — a session that goes quiet (no events for
+ *                      `capture.idleMs`) without a usable capture gets one
+ *                      extra pass over its uncaptured tail, so closing an idle
+ *                      session does not drop the last exchange.
+ *
  * Configuration precedence: defaults < ~/.config/opencode/mnemosyne.json
  * < environment variables (MNEMOSYNE_*). The bearer token is resolved from
  * MNEMOSYNE_API_KEY, the config file, or — when neither is set — from the
@@ -117,6 +122,19 @@ interface PluginSettings {
      * capture, so this bounds how long it can be delayed.
      */
     compactionTimeoutMs: number
+    /**
+     * Safety net for an idle session. Per-turn capture can miss an exchange
+     * (the per-session gap, a capture already in flight, a transient failure),
+     * and a turn that ends without a capture-triggering event (a failed turn)
+     * is never captured on its own. Once a session has had
+     * no events for this long and is not running a turn, run one extra capture
+     * pass over its uncaptured tail. This also gets the tail recorded before
+     * OpenCode evicts the location's services after its own inactivity window.
+     * Set to 0 to disable.
+     */
+    idleMs: number
+    /** Exchanges examined by one idle safety-net pass. */
+    idleExchanges: number
   }
   sleep: {
     enabled: boolean
@@ -215,6 +233,11 @@ const DEFAULTS: PluginSettings = {
     onInterrupt: true,
     compactionExchanges: 12,
     compactionTimeoutMs: 20_000,
+    // Quiet for ten minutes means the user has walked away, not that a turn is
+    // still being written. OpenCode itself keeps a location alive for about an
+    // hour of inactivity, so this fires well before the tail could be lost.
+    idleMs: 10 * 60_000,
+    idleExchanges: 12,
   },
   // Mirrors the Hermes `auto_sleep` behaviour (mnemosyne provider): run the
   // consolidation cycle once working memory accumulates past a threshold so
@@ -387,6 +410,8 @@ function resolveSettings(): PluginSettings {
     if (typeof cap.onInterrupt === "boolean") settings.capture.onInterrupt = cap.onInterrupt
     if (typeof cap.compactionExchanges === "number") settings.capture.compactionExchanges = cap.compactionExchanges
     if (typeof cap.compactionTimeoutMs === "number") settings.capture.compactionTimeoutMs = cap.compactionTimeoutMs
+    if (typeof cap.idleMs === "number") settings.capture.idleMs = cap.idleMs
+    if (typeof cap.idleExchanges === "number") settings.capture.idleExchanges = cap.idleExchanges
   }
   const slp = asObj(cfg?.sleep)
   if (slp) {
@@ -444,6 +469,11 @@ function resolveSettings(): PluginSettings {
   settings.capture.compactionTimeoutMs = num(
     process.env.MNEMOSYNE_CAPTURE_COMPACTION_TIMEOUT_MS,
     settings.capture.compactionTimeoutMs,
+  )
+  settings.capture.idleMs = num(process.env.MNEMOSYNE_CAPTURE_IDLE_MS, settings.capture.idleMs)
+  settings.capture.idleExchanges = num(
+    process.env.MNEMOSYNE_CAPTURE_IDLE_EXCHANGES,
+    settings.capture.idleExchanges,
   )
   const capModel = envOr("MNEMOSYNE_CAPTURE_MODEL")
   if (capModel) settings.capture.model = capModel
@@ -1053,6 +1083,10 @@ export default {
     const capturer = settings.capture.enabled
       ? new CaptureRunner(ctx as unknown as CtxLike, client, settings, log, warn)
       : null
+    // Idle safety net: watches every session event, so it can tell a session
+    // that finished and went quiet from one that is still running.
+    const idleRunner =
+      capturer && settings.capture.idleMs > 0 ? new IdleCaptureRunner(capturer, settings, log, warn) : null
     if (capturer) {
       const capture = capturer
       // The plugin loads once per location; only this instance's project
@@ -1061,6 +1095,7 @@ export default {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
           try {
             const e = event as Loose
+            idleRunner?.observe(e)
             const type = typeof e.type === "string" ? e.type : ""
             // This build emits session.execution.succeeded when a user turn
             // completes (session.idle / session.status are not published).
@@ -1093,6 +1128,7 @@ export default {
         }
       })
     }
+    idleRunner?.start()
 
     /* ---------------- 2b. COMPACTION CAPTURE (distill before summary) ------ */
 
@@ -1249,6 +1285,7 @@ export default {
 
     return async () => {
       controller.abort()
+      idleRunner?.stop()
       mcpHealth?.stop()
       for (const t of timers) clearTimeout(t)
       for (const reg of disposables) await reg.dispose().catch(() => undefined)
@@ -1305,7 +1342,11 @@ class CaptureRunner {
     private readonly warn: (...args: unknown[]) => void,
   ) {}
 
-  async run(sessionID: string, reason = "idle"): Promise<void> {
+  async run(
+    sessionID: string,
+    reason = "idle",
+    opts: { bypassGap?: boolean; maxExchanges?: number; firstRunLimit?: number } = {},
+  ): Promise<void> {
     if (this.running.has(sessionID)) return
     // The plugin loads once per location/project. Capture only sessions that
     // belong to THIS instance's project so each session is captured exactly
@@ -1320,12 +1361,14 @@ class CaptureRunner {
         // location unknown — fall through to jitter + cursor dedupe
       }
     }
-    const gap = Date.now() - (this.lastRun.get(sessionID) ?? 0)
-    if (gap < this.settings.capture.minGapMs) return
+    if (!opts.bypassGap) {
+      const gap = Date.now() - (this.lastRun.get(sessionID) ?? 0)
+      if (gap < this.settings.capture.minGapMs) return
+    }
     this.running.add(sessionID)
     this.lastRun.set(sessionID, Date.now())
     try {
-      await this.doCapture(sessionID, reason)
+      await this.doCapture(sessionID, reason, opts.maxExchanges, opts.firstRunLimit)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       this.warn(`capture failed for ${sessionID}: ${msg}`)
@@ -1339,7 +1382,12 @@ class CaptureRunner {
     }
   }
 
-  private async doCapture(sessionID: string, reason: string): Promise<void> {
+  private async doCapture(
+    sessionID: string,
+    reason: string,
+    maxExchanges?: number,
+    firstRunLimit?: number,
+  ): Promise<void> {
     // Small settle delay (jittered) so the final assistant message is persisted
     // and concurrent instances rarely collide.
     await sleep(1200 + Math.random() * 1300)
@@ -1352,7 +1400,8 @@ class CaptureRunner {
     }
     if (!Array.isArray(messages) || messages.length === 0) return
     await this.captureMessages(sessionID, messages, {
-      maxExchanges: this.settings.capture.exchanges,
+      maxExchanges: maxExchanges ?? this.settings.capture.exchanges,
+      firstRunLimit,
       deadline: 0,
       extraTags: [],
       reason,
@@ -1411,7 +1460,7 @@ class CaptureRunner {
   private async captureMessages(
     sessionID: string,
     messages: Loose[],
-    opts: { maxExchanges: number; deadline: number; extraTags: string[]; reason: string },
+    opts: { maxExchanges: number; firstRunLimit?: number; deadline: number; extraTags: string[]; reason: string },
   ): Promise<void> {
     if (!Array.isArray(messages) || messages.length === 0) return
 
@@ -1433,7 +1482,7 @@ class CaptureRunner {
     }
     if (start >= messages.length) return
 
-    const exchanges = this.buildExchanges(messages, start, !cursorFound, opts.maxExchanges)
+    const exchanges = this.buildExchanges(messages, start, !cursorFound, opts.firstRunLimit ?? opts.maxExchanges)
     if (exchanges.length === 0) return
 
     // Process oldest-first so the cursor stays contiguous when capped.
@@ -1570,6 +1619,126 @@ class CaptureRunner {
       veracity: "inferred", // LLM-extracted from the transcript, not a direct quote
       metadata: { tags: [...new Set(tags)] },
     })
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * Idle capture (safety net for a session that goes quiet)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Per-turn capture relies on an event arriving when a turn finishes. If that
+ * capture is skipped (the per-session gap, a capture already in flight, a
+ * transient failure) or the turn ends without a capture-triggering event (a
+ * failed turn), the tail stays in the transcript with no further trigger. A
+ * user who then leaves the session idle and closes it would lose that tail once
+ * the location's services are evicted.
+ *
+ * This watcher tracks the last event seen for every session and whether a turn
+ * is currently running. When a session has been quiet for `capture.idleMs`, it
+ * runs one extra capture pass over the uncaptured tail. The pass is cheap when
+ * everything is already captured: the cursor check returns before calling the
+ * summarizer or Mnemosyne.
+ */
+class IdleCaptureRunner {
+  private readonly tracked = new Map<string, { lastEvent: number; busy: boolean; flushedAt: number }>()
+  private timer: ReturnType<typeof setInterval> | null = null
+
+  constructor(
+    private readonly capture: CaptureRunner,
+    private readonly settings: PluginSettings,
+    private readonly log: (...args: unknown[]) => void,
+    private readonly warn: (...args: unknown[]) => void,
+  ) {}
+
+  start(): void {
+    if (this.timer) return
+    const idleMs = Math.max(1, this.settings.capture.idleMs)
+    // Sweep often enough to fire close to the configured threshold without a
+    // timer per session. At the default ten minutes this is still only one
+    // small pass per minute.
+    const tick = Math.max(250, Math.min(60_000, Math.floor(idleMs / 2)))
+    this.timer = setInterval(() => this.sweep(), tick)
+  }
+
+  stop(): void {
+    if (this.timer) clearInterval(this.timer)
+    this.timer = null
+  }
+
+  /** Record activity for one session event. Every event type counts. */
+  observe(event: Loose): void {
+    const data = event.data as Loose | undefined
+    const sessionID =
+      typeof data?.sessionID === "string"
+        ? data.sessionID
+        : typeof event.sessionID === "string"
+          ? event.sessionID
+          : ""
+    if (!sessionID) return
+
+    const type = typeof event.type === "string" ? event.type : ""
+    if (type === "session.execution.interrupted") {
+      const reason = typeof data?.reason === "string" ? data.reason : ""
+      // These two mean the location is being torn down, so a capture that is
+      // armed now could not finish. The 10-minute pass already had its chance.
+      if (reason === "shutdown" || reason === "inactivity") {
+        this.tracked.delete(sessionID)
+        return
+      }
+    }
+
+    const now = Date.now()
+    const entry = this.tracked.get(sessionID) ?? { lastEvent: now, busy: false, flushedAt: 0 }
+    entry.lastEvent = now
+    if (type === "session.execution.started") {
+      entry.busy = true
+    } else if (
+      type === "session.execution.succeeded" ||
+      type === "session.execution.failed" ||
+      type === "session.execution.interrupted" ||
+      type === "session.idle" ||
+      (type === "session.status" && data?.status?.type === "idle")
+    ) {
+      entry.busy = false
+    }
+    this.tracked.set(sessionID, entry)
+
+    // The map is keyed by live session, but a long-lived location sees many.
+    if (this.tracked.size > 5_000) this.prune(now, Math.max(this.settings.capture.idleMs * 4, 60 * 60_000))
+  }
+
+  private sweep(): void {
+    const now = Date.now()
+    const idleMs = Math.max(1, this.settings.capture.idleMs)
+    for (const [sessionID, entry] of this.tracked) {
+      if (entry.busy) continue
+      if (now - entry.lastEvent < idleMs) continue
+      // One pass per quiet period. A new event resets lastEvent and arms it again.
+      if (entry.flushedAt >= entry.lastEvent) continue
+      entry.flushedAt = now
+      if (this.settings.log.capture) {
+        this.log(`idle capture: ${sessionID} quiet for ${Math.round((now - entry.lastEvent) / 1000)}s`)
+      }
+      void this.capture
+        .run(sessionID, "on-idle", {
+          bypassGap: true,
+          maxExchanges: this.settings.capture.idleExchanges,
+          // Only re-examine the normal recent window when the cursor is gone
+          // (e.g. after a compaction). Looking back `idleExchanges` in that
+          // case would re-capture the tail compaction just stored.
+          firstRunLimit: this.settings.capture.exchanges,
+        })
+        .catch((err) => this.warn(`idle capture failed for ${sessionID}: ${err instanceof Error ? err.message : err}`))
+    }
+    this.prune(now, Math.max(idleMs * 4, 6 * 60 * 60_000))
+  }
+
+  /** Drop sessions that have been silent for a long time and are not running. */
+  private prune(now: number, maxAgeMs: number): void {
+    for (const [sessionID, entry] of this.tracked) {
+      if (!entry.busy && now - entry.lastEvent > maxAgeMs) this.tracked.delete(sessionID)
+    }
   }
 }
 
