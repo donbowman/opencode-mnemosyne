@@ -847,7 +847,9 @@ const DEFAULT_HANDOFF_INSTRUCTION = `Distill your learnings to Mnemosyne and pre
 Put everything that must survive the loss of this transcript into these two forms:
 
 1. Mnemosyne. Store the durable facts this session established and that are not already stored: decisions, corrections, user preferences, fixes, and verified findings. Use the mnemosyne tools (one fact per call, a standalone sentence, scope 'global', a source category such as decision|fact|insight|fix|preference, and tags in metadata.tags). Do not announce tool use.
-2. A handoff note, in your reply. State the task and its current state, what is done and verified, what remains, the files or commands that matter, and any open questions or pitfalls. Keep it tight: this is a briefing for whoever continues the work, not a transcript. It is recalled automatically after the compaction, so write it to stand on its own.`
+2. A handoff note, in your reply. State the task and its current state, what is done and verified, what remains, the files or commands that matter, and any open questions or pitfalls. Keep it tight: this is a briefing for whoever continues the work, not a transcript. It is recalled automatically after the compaction, so write it to stand on its own.
+
+If you need to run a command (git, glab, a test) while doing this, use the shell tool, not the execute tool: execute is a sandbox with no module loader, so await import(...) fails with a SyntaxError.`
 
 /** Resolve guidance text: inline > file > built-in. */
 function loadGuidance(settings: PluginSettings): string {

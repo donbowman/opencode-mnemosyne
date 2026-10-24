@@ -293,6 +293,11 @@ async function main(): Promise<void> {
     "the prompt carries the handoff instruction",
   )
   assert.match(String(app.prompts[0].text), /focus on the auth change/, "trailing arguments become focus text")
+  assert.match(
+    String(app.prompts[0].text),
+    /use the shell tool, not the execute tool/,
+    "the prompt warns against dynamic import() in the execute sandbox",
+  )
 
   assert.equal(app.compacts.length, 1, "/handoff requests exactly one compaction")
   assert.equal(app.compacts[0].sessionID, "s3", "the compaction targets the invoking session")

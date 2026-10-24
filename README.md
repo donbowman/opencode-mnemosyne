@@ -248,8 +248,10 @@ The submitted turn begins with the line the command is named for:
 
 followed by the specifics (store the durable facts with the `mnemosyne_*` tools,
 then leave a tight handoff note: current state, what is done and verified, what
-remains, the files that matter, open questions). Any text you type after
-`/handoff` is appended as extra focus for that turn.
+remains, the files that matter, open questions). It also tells the model to run
+any command with the shell tool rather than the `execute` sandbox, which has no
+module loader and rejects `await import(...)` with a `SyntaxError`. Any text you
+type after `/handoff` is appended as extra focus for that turn.
 
 | Key | Meaning |
 |---|---|
